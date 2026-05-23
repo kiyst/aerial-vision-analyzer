@@ -1,0 +1,25 @@
+[project]
+name = "aerial-vision-analyzer"
+version = "0.1.0"
+description = "Plain-image aerial computer vision analysis starter."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy<2",
+  "Pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+ml = [
+  "opencv-python<4.12",
+  "ultralytics>=8.3.0",
+]
+rfdetr = [
+  "rfdetr==1.4.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
