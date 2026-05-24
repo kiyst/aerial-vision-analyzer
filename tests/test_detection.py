@@ -368,6 +368,8 @@ class DetectionTest(unittest.TestCase):
         self.assertIn("Aerial Vision Dashboard", html)
         self.assertIn("positives/00-00-01.jpg", html)
         self.assertIn('"animal": 2', html)
+        self.assertIn("review_decisions.json", html)
+        self.assertIn("buildDecisionPayload", html)
 
     def test_frame_difference_detects_visual_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -248,8 +248,8 @@ The JSON output includes:
 - People can false-positive in scenes where no people exist.
 - Buildings, roads, paths, and nature features are not properly segmented yet.
 - The current video workflow scans saved video files, not live camera streams.
-- Review decisions are stored in browser local storage, not exported to a
-  durable report yet.
+- Review decisions can be exported from the browser as JSON, but the static
+  HTML page cannot silently write that file back into the run folder.
 
 ## Video Field Review
 
@@ -306,6 +306,7 @@ dashboard is designed for field triage:
 - per-event detection counts, confidence, and difference scores
 - links to each annotated frame and JSON file
 - status buttons for `Confirm`, `Dismiss`, and `Unreviewed`
+- an `Export JSON` button that downloads `review_decisions.json`
 
 Keyboard controls:
 
@@ -317,6 +318,14 @@ End                       last visible event
 Q                         confirm selected event
 W                         dismiss selected event
 E                         mark selected event unreviewed
+```
+
+The exported review file includes run metadata, status counts, and every event
+with its current review status. Save that downloaded file next to the run if
+you want the folder to contain the final field decisions:
+
+```text
+field_runs/flight01/review_decisions.json
 ```
 
 Use `--min-detection-difference` to skip repeated positives whose detections
@@ -333,14 +342,14 @@ not committed accidentally.
 
 ## Recommended Next Milestone
 
-The next best milestone is saving review decisions from `review.html` into a
-portable report, such as:
+The next best milestone is exporting a smaller confirmed-only package:
 
 ```text
-field_runs/flight01/review_decisions.json
+confirmed_events.json
+confirmed_images/
 ```
 
-After that, the project can add an export for confirmed events only.
+That would make it easier to hand off only the moments worth keeping.
 
 ## Tests
 

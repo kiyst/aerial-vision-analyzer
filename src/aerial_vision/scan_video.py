@@ -115,6 +115,14 @@ def detection_difference(
 def render_review_html(report: dict[str, object]) -> str:
     video = report["video"]
     events_json = json.dumps(report["events"]).replace("</", "<\\/")
+    video_json = json.dumps(video).replace("</", "<\\/")
+    profile_json = json.dumps(report["profile"]).replace("</", "<\\/")
+    sample_every_json = json.dumps(report["sample_every_sec"])
+    min_frame_difference_json = json.dumps(report.get("min_frame_difference", 0))
+    min_detection_difference_json = json.dumps(report.get("min_detection_difference", 0))
+    frames_checked_json = json.dumps(report["frames_checked"])
+    positive_frames_json = json.dumps(report["positive_frames"])
+    skipped_similar_json = json.dumps(report.get("skipped_similar_positive_frames", 0))
 
     return f"""<!doctype html>
 <html lang="en">
@@ -431,6 +439,7 @@ def render_review_html(report: dict[str, object]) -> str:
           <button type="button" data-action="unreviewed" title="Mark selected event as unreviewed">Unreviewed</button>
           <button type="button" data-action="confirmed" title="Confirm selected event">Confirm</button>
           <button type="button" data-action="dismissed" title="Dismiss selected event">Dismiss</button>
+          <button type="button" id="exportDecisions" title="Download review_decisions.json">Export JSON</button>
         </div>
       </header>
       <section id="viewer" class="viewer">
@@ -454,6 +463,7 @@ def render_review_html(report: dict[str, object]) -> str:
     const eventTitle = document.getElementById("eventTitle");
     const labelFilter = document.getElementById("labelFilter");
     const statusFilter = document.getElementById("statusFilter");
+    const exportDecisions = document.getElementById("exportDecisions");
 
     function eventId(event) {{
       return String(event.timestamp_sec ?? event.timestamp ?? event.frame_index);
@@ -483,6 +493,52 @@ def render_review_html(report: dict[str, object]) -> str:
 
     function confidenceText(value) {{
       return value === null || value === undefined ? "n/a" : Number(value).toFixed(3);
+    }}
+
+    function buildDecisionPayload() {{
+      const reviewedEvents = events.map(event => ({{
+        id: eventId(event),
+        status: getStatus(event),
+        timestamp: event.timestamp,
+        timestamp_sec: event.timestamp_sec ?? null,
+        frame_index: event.frame_index ?? null,
+        counts_by_label: event.counts_by_label || {{}},
+        total_detections: event.total_detections,
+        average_confidence: event.average_confidence ?? null,
+        annotated_image: event.annotated_image,
+        detections_json: event.detections_json,
+      }}));
+      const statusCounts = reviewedEvents.reduce((counts, event) => {{
+        counts[event.status] = (counts[event.status] || 0) + 1;
+        return counts;
+      }}, {{ confirmed: 0, dismissed: 0, unreviewed: 0 }});
+
+      return {{
+        exported_at: new Date().toISOString(),
+        video: {video_json},
+        profile: {profile_json},
+        sample_every_sec: {sample_every_json},
+        min_frame_difference: {min_frame_difference_json},
+        min_detection_difference: {min_detection_difference_json},
+        frames_checked: {frames_checked_json},
+        positive_frames: {positive_frames_json},
+        skipped_similar_positive_frames: {skipped_similar_json},
+        status_counts: statusCounts,
+        events: reviewedEvents,
+      }};
+    }}
+
+    function downloadReviewDecisions() {{
+      const payload = buildDecisionPayload();
+      const blob = new Blob([JSON.stringify(payload, null, 2) + "\\n"], {{ type: "application/json" }});
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "review_decisions.json";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
     }}
 
     function labels() {{
@@ -620,6 +676,7 @@ def render_review_html(report: dict[str, object]) -> str:
     }});
     labelFilter.addEventListener("change", render);
     statusFilter.addEventListener("change", render);
+    exportDecisions.addEventListener("click", downloadReviewDecisions);
     document.addEventListener("keydown", event => {{
       const tagName = event.target?.tagName;
       if (tagName === "SELECT" || tagName === "INPUT" || tagName === "TEXTAREA") return;
