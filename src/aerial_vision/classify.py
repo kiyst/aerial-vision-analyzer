@@ -6,51 +6,7 @@ from pathlib import Path
 
 from aerial_vision.analysis import ImageAnalysis
 from aerial_vision.annotate import draw_detections
-from aerial_vision.detection import ANIMAL_LABELS, OVERHEAD_VEHICLE_GEOMETRY_RULES, collapse_labels, filter_by_geometry
-from aerial_vision.image_io import read_image_size
-from aerial_vision.rfdetr_detector import RFDetrObjectDetector
-from aerial_vision.tiling import detect_tiled, non_max_suppression
-from aerial_vision.yolo_detector import YoloObjectDetector
-
-
-PROFILE_CONFIGS = {
-    "general": {
-        "model": "models/best.pt",
-        "objects": ["car", "van", "truck", "bus", "motor", "bicycle", "pedestrian", "people"],
-        "min_confidence": 0.15,
-        "tile_size": 800,
-        "tile_overlap": 240,
-        "geometry_preset": "overhead-vehicles",
-        "extra_model": "yolo11x.pt",
-        "extra_objects": ["horse", "cow", "sheep", "dog", "cat", "bird"],
-        "extra_min_confidence": 0.05,
-        "collapse_animals": True,
-    },
-    "vehicles": {
-        "model": "models/best.pt",
-        "objects": ["car", "van", "truck", "bus", "motor", "bicycle"],
-        "min_confidence": 0.15,
-        "tile_size": 800,
-        "tile_overlap": 240,
-        "geometry_preset": "overhead-vehicles",
-    },
-    "humans": {
-        "model": "models/best.pt",
-        "objects": ["pedestrian", "people"],
-        "min_confidence": 0.20,
-        "tile_size": 800,
-        "tile_overlap": 240,
-        "geometry_preset": "overhead-vehicles",
-    },
-    "animals": {
-        "model": "yolo11x.pt",
-        "objects": ["horse", "cow", "sheep", "dog", "cat", "bird"],
-        "min_confidence": 0.05,
-        "tile_size": 800,
-        "tile_overlap": 240,
-        "collapse_animals": True,
-    },
-}
+from aerial_vision.pipeline import DetectionSettings, PROFILE_CONFIGS, analyze_image
 
 
 def clean_previous_outputs(output_paths: list[Path]) -> None:
@@ -153,42 +109,6 @@ def apply_profile_defaults(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
-def build_detector(backend: str, model: str, rfdetr_size: str) -> object:
-    if backend == "rfdetr":
-        checkpoint_path = None if model == "yolo11n.pt" else model
-        return RFDetrObjectDetector(model_size=rfdetr_size, checkpoint_path=checkpoint_path)
-
-    return YoloObjectDetector(model)
-
-
-def run_detector(
-    detector: object,
-    image_path: Path,
-    *,
-    min_confidence: float,
-    objects: set[str] | None,
-    tile_size: int | None,
-    tile_overlap: int,
-    nms_iou: float,
-) -> list:
-    if tile_size:
-        return detect_tiled(
-            detector,
-            image_path,
-            tile_size=tile_size,
-            overlap=tile_overlap,
-            min_confidence=min_confidence,
-            objects_of_interest=objects,
-            nms_iou_threshold=nms_iou,
-        )
-
-    return detector.detect(
-        image_path,
-        min_confidence=min_confidence,
-        objects_of_interest=objects,
-    )
-
-
 def format_summary(analysis: ImageAnalysis) -> str:
     lines = [
         f"image: {analysis.image_path}",
@@ -211,55 +131,26 @@ def main() -> None:
     output_paths = [path for path in (args.json_out, args.annotated_out) if path is not None]
     clean_previous_outputs(output_paths)
 
-    detector = build_detector(args.backend, args.model, args.rfdetr_size)
-    objects = set(args.objects) if args.objects else None
-    width_px, height_px = read_image_size(args.image)
-    detections = run_detector(
-        detector,
-        args.image,
+    settings = DetectionSettings(
+        backend=args.backend,
+        model=args.model,
+        rfdetr_size=args.rfdetr_size,
         min_confidence=args.min_confidence,
-        objects=objects,
+        objects=args.objects,
+        extra_model=args.extra_model,
+        extra_objects=args.extra_objects,
+        extra_min_confidence=args.extra_min_confidence,
         tile_size=args.tile_size,
         tile_overlap=args.tile_overlap,
         nms_iou=args.nms_iou,
-    )
-
-    if args.extra_model:
-        extra_detector = YoloObjectDetector(args.extra_model)
-        extra_objects = set(args.extra_objects) if args.extra_objects else None
-        extra_min_confidence = args.extra_min_confidence if args.extra_min_confidence is not None else args.min_confidence
-        detections.extend(
-            run_detector(
-                extra_detector,
-                args.image,
-                min_confidence=extra_min_confidence,
-                objects=extra_objects,
-                tile_size=args.tile_size,
-                tile_overlap=args.tile_overlap,
-                nms_iou=args.nms_iou,
-            )
-        )
-        detections = non_max_suppression(detections, iou_threshold=args.nms_iou)
-
-    detections = filter_by_geometry(
-        detections,
-        image_width=width_px,
-        image_height=height_px,
         max_area_ratio=args.max_area_ratio,
         max_width_ratio=args.max_width_ratio,
         max_height_ratio=args.max_height_ratio,
         min_area_px=args.min_area_px,
-        per_label_rules=OVERHEAD_VEHICLE_GEOMETRY_RULES if args.geometry_preset == "overhead-vehicles" else None,
+        geometry_preset=args.geometry_preset,
+        collapse_animals=args.collapse_animals,
     )
-    if args.collapse_animals:
-        detections = collapse_labels(detections, {"animal": ANIMAL_LABELS})
-
-    analysis = ImageAnalysis(
-        image_path=str(args.image),
-        image_width=width_px,
-        image_height=height_px,
-        detections=detections,
-    )
+    analysis = analyze_image(args.image, settings)
     output = json.dumps(analysis.to_dict(), indent=2)
 
     if args.json_out:
@@ -269,7 +160,8 @@ def main() -> None:
         print(output)
 
     if args.annotated_out:
-        draw_detections(args.image, detections, args.annotated_out)
+        args.annotated_out.parent.mkdir(parents=True, exist_ok=True)
+        draw_detections(args.image, analysis.detections, args.annotated_out)
 
     if args.json_out or args.annotated_out:
         print(format_summary(analysis))

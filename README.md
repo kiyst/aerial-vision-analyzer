@@ -34,6 +34,10 @@ person can inspect the image or frame.
 - Export JSON with image metadata, counts, confidence scores, boxes, centers,
   and pixel areas.
 - Clear previous files from `outputs/` on each run.
+- Scan video files by sampling frames at a chosen interval.
+- Keep only positive frames by default.
+- Skip repeated positive frames when detections look too similar.
+- Generate a self-contained field review dashboard at `review.html`.
 
 ## Project Philosophy
 
@@ -44,6 +48,17 @@ aerial image or drone frame
 → run object detection
 → save annotated output
 → human reviews positives
+```
+
+For video, the workflow is:
+
+```text
+video file
+→ sample frames every N seconds
+→ run the selected detection profile
+→ keep positive moments
+→ open review.html
+→ confirm, dismiss, or leave events unreviewed
 ```
 
 For wildlife and security use cases, the model should be treated as a screening
@@ -232,20 +247,23 @@ The JSON output includes:
   class.
 - People can false-positive in scenes where no people exist.
 - Buildings, roads, paths, and nature features are not properly segmented yet.
-- The current system works on images, not video streams yet.
+- The current video workflow scans saved video files, not live camera streams.
+- Review decisions are stored in browser local storage, not exported to a
+  durable report yet.
 
-## Recommended Next Milestone
+## Video Field Review
 
-The next major software step is video scanning:
+Scan a video file:
 
 ```bash
 python3 -m aerial_vision.scan_video videos/flight01.mp4 \
   --profile general \
   --sample-every-sec 1 \
+  --min-detection-difference 0.04 \
   --out field_runs/flight01
 ```
 
-Planned behavior:
+Behavior:
 
 ```text
 video file
@@ -254,11 +272,75 @@ video file
 → save positive frames
 → save annotated frames
 → save per-frame JSON
-→ write a review report with timestamps
+→ write report.json
+→ write review.html
 ```
 
-That would turn this from a single-image tool into a field-review workflow for
-drone footage.
+Output structure:
+
+```text
+field_runs/flight01/
+  report.json
+  review.html
+  positives/
+    00-01-24.jpg
+  detections/
+    00-01-24.json
+```
+
+By default, raw sampled frames are temporary and only annotated positives are
+kept. Use `--save-raw-frames` to keep raw positive frames, or `--save-empty` to
+also keep sampled frames that had no detections.
+
+Each run clears and rebuilds the target output folder passed to `--out`.
+
+The scanner loads the selected model profile once per run and reuses those
+model objects for each sampled frame.
+
+Open `review.html` in a browser to review the positive moments visually. The
+dashboard is designed for field triage:
+
+- left-side event list
+- selected annotated frame viewer
+- label and status filters
+- per-event detection counts, confidence, and difference scores
+- links to each annotated frame and JSON file
+- status buttons for `Confirm`, `Dismiss`, and `Unreviewed`
+
+Keyboard controls:
+
+```text
+Arrow Down / Arrow Right  next event
+Arrow Up / Arrow Left     previous event
+Home                      first visible event
+End                       last visible event
+Q                         confirm selected event
+W                         dismiss selected event
+E                         mark selected event unreviewed
+```
+
+Use `--min-detection-difference` to skip repeated positives whose detections
+look similar to the last kept positive. This compares labels, box centers, and
+box sizes. A starting value of `0.04` works well for collapsing stationary-object
+repeats.
+
+Use `--min-frame-difference` if you want to compare the whole frame visually
+instead. Detection difference is usually better for drone footage because it
+focuses on the detected objects rather than the entire background.
+
+`field_runs/` and `videos/` are ignored by git so large local run artifacts are
+not committed accidentally.
+
+## Recommended Next Milestone
+
+The next best milestone is saving review decisions from `review.html` into a
+portable report, such as:
+
+```text
+field_runs/flight01/review_decisions.json
+```
+
+After that, the project can add an export for confirmed events only.
 
 ## Tests
 
@@ -267,4 +349,3 @@ Run tests:
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
-

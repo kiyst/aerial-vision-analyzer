@@ -4,6 +4,8 @@ __pycache__/
 .venv/
 *.egg-info/
 outputs/
+field_runs/
+videos/
 models/
 *.pt
 *.pth
