@@ -38,6 +38,8 @@ person can inspect the image or frame.
 - Keep only positive frames by default.
 - Skip repeated positive frames when detections look too similar.
 - Generate a self-contained field review dashboard at `review.html`.
+- Track vehicles through video with persistent track IDs.
+- Log basic appearance consistency using color and shape scores.
 
 ## Project Philosophy
 
@@ -306,7 +308,8 @@ dashboard is designed for field triage:
 - per-event detection counts, confidence, and difference scores
 - links to each annotated frame and JSON file
 - status buttons for `Confirm`, `Dismiss`, and `Unreviewed`
-- an `Export JSON` button that downloads `review_decisions.json`
+- a `Download` button that downloads `review.html` and
+  `review_decisions.json`
 
 Keyboard controls:
 
@@ -318,14 +321,37 @@ End                       last visible event
 Q                         confirm selected event
 W                         dismiss selected event
 E                         mark selected event unreviewed
+D                         download review.html and review_decisions.json
 ```
 
-The exported review file includes run metadata, status counts, and every event
-with its current review status. Save that downloaded file next to the run if
-you want the folder to contain the final field decisions:
+The downloaded review decisions file includes run metadata, status counts, and
+every event with its current review status. Save that downloaded file next to
+the run if you want the folder to contain the final field decisions:
 
 ```text
 field_runs/flight01/review_decisions.json
+```
+
+If you do not press `D`, closing the review tab is the abandon/reject path. No
+portable review package is created.
+
+Export confirmed events only:
+
+```bash
+python3 -m aerial_vision.export_review field_runs/flight01/review_decisions.json \
+  --run-dir field_runs/flight01 \
+  --out field_runs/flight01/confirmed_export
+```
+
+Output structure:
+
+```text
+field_runs/flight01/confirmed_export/
+  confirmed_events.json
+  images/
+    00-01-24.jpg
+  detections/
+    00-01-24.json
 ```
 
 Use `--min-detection-difference` to skip repeated positives whose detections
@@ -337,19 +363,66 @@ Use `--min-frame-difference` if you want to compare the whole frame visually
 instead. Detection difference is usually better for drone footage because it
 focuses on the detected objects rather than the entire background.
 
-`field_runs/` and `videos/` are ignored by git so large local run artifacts are
-not committed accidentally.
+## Target Tracking Prototype
+
+Track vehicles through a video and write persistent track IDs:
+
+```bash
+python3 -m aerial_vision.track_video videos/highway.mp4 \
+  --profile vehicles \
+  --out tracking_runs/highway \
+  --max-frames 90 \
+  --resize-width 960 \
+  --min-track-frames 5
+```
+
+Output structure:
+
+```text
+tracking_runs/highway/
+  tracks.json
+  tracked_preview.mp4
+```
+
+`tracks.json` includes each exported track's boxes, timestamps, class labels,
+confidence scores, color histogram, shape data, and basic identity scores.
+The preview video draws track IDs on top of the source footage.
+
+Useful flags:
+
+```text
+--tracker bytetrack.yaml       default Ultralytics tracker
+--tracker botsort.yaml         stronger tracker option to compare
+--resize-width 960             faster tracking while preserving useful detail
+--sample-every-sec 1           track sampled frames instead of every frame
+--min-track-frames 5           only export tracks seen at least 5 frames
+--max-frames 90                quick smoke test
+```
+
+On `videos/highway.mp4`, a 90-frame comparison kept nearly the same useful
+long-running tracks at 960px wide as the full 1920px source. In that test,
+960px preserved the label mix and long-track counts better than dropping to
+720px, while producing much smaller preview files. Use full resolution for
+final/high-confidence analysis, but start tracking experiments at 960px.
+
+This is an early prototype for operator-selected target lock. It does not
+control a drone yet.
+
+`field_runs/`, `tracking_runs/`, and `videos/` are ignored by git so large
+local run artifacts are not committed accidentally.
 
 ## Recommended Next Milestone
 
-The next best milestone is exporting a smaller confirmed-only package:
+The next best milestone is a small local review server:
 
 ```text
-confirmed_events.json
-confirmed_images/
+review.html
+→ save decisions directly into the run folder
+→ avoid manual browser downloads
 ```
 
-That would make it easier to hand off only the moments worth keeping.
+That would make field review smoother while keeping the current static HTML
+workflow as the portable fallback.
 
 ## Tests
 

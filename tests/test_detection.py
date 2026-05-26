@@ -1,9 +1,11 @@
+import json
 import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 from PIL import Image
 
 import aerial_vision.classify as classify_module
@@ -18,6 +20,7 @@ from aerial_vision.detection import (
     filter_by_geometry,
     filter_detections,
 )
+from aerial_vision.export_review import export_confirmed, safe_run_path
 from aerial_vision.pipeline import DetectionSettings, DetectorBundle, analyze_image_with_detectors
 from aerial_vision.scan_video import (
     detection_difference,
@@ -27,6 +30,7 @@ from aerial_vision.scan_video import (
     render_review_html,
     timestamp_display,
 )
+from aerial_vision.track_video import color_histogram, cosine_similarity, identity_score, observation_from_box, track_video
 from aerial_vision.tiling import bbox_iou, generate_tiles, non_max_suppression, shift_detections
 
 
@@ -369,7 +373,9 @@ class DetectionTest(unittest.TestCase):
         self.assertIn("positives/00-00-01.jpg", html)
         self.assertIn('"animal": 2', html)
         self.assertIn("review_decisions.json", html)
+        self.assertIn("review.html", html)
         self.assertIn("buildDecisionPayload", html)
+        self.assertIn("downloadReviewPackage", html)
 
     def test_frame_difference_detects_visual_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -395,6 +401,104 @@ class DetectionTest(unittest.TestCase):
             detection_difference(first, different, image_width=100, image_height=100),
             0.4,
         )
+
+    def test_export_confirmed_copies_only_confirmed_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir) / "run"
+            positives_dir = run_dir / "positives"
+            detections_dir = run_dir / "detections"
+            positives_dir.mkdir(parents=True)
+            detections_dir.mkdir()
+            (positives_dir / "confirmed.jpg").write_text("confirmed-image", encoding="utf-8")
+            (positives_dir / "dismissed.jpg").write_text("dismissed-image", encoding="utf-8")
+            (detections_dir / "confirmed.json").write_text("{}", encoding="utf-8")
+            (detections_dir / "dismissed.json").write_text("{}", encoding="utf-8")
+            decisions_path = run_dir / "review_decisions.json"
+            decisions_path.write_text(
+                """
+                {
+                  "video": {"path": "videos/test.mp4"},
+                  "profile": "general",
+                  "events": [
+                    {
+                      "id": "1",
+                      "status": "confirmed",
+                      "timestamp": "00:00:01",
+                      "annotated_image": "positives/confirmed.jpg",
+                      "detections_json": "detections/confirmed.json"
+                    },
+                    {
+                      "id": "2",
+                      "status": "dismissed",
+                      "timestamp": "00:00:02",
+                      "annotated_image": "positives/dismissed.jpg",
+                      "detections_json": "detections/dismissed.json"
+                    }
+                  ]
+                }
+                """,
+                encoding="utf-8",
+            )
+
+            output = export_confirmed(decisions_path)
+
+            self.assertEqual(output["confirmed_count"], 1)
+            self.assertTrue((run_dir / "confirmed_export" / "images" / "confirmed.jpg").exists())
+            self.assertTrue((run_dir / "confirmed_export" / "detections" / "confirmed.json").exists())
+            self.assertFalse((run_dir / "confirmed_export" / "images" / "dismissed.jpg").exists())
+            exported = json.loads((run_dir / "confirmed_export" / "confirmed_events.json").read_text(encoding="utf-8"))
+            self.assertEqual(exported["events"][0]["exported_annotated_image"], "images/confirmed.jpg")
+
+    def test_safe_run_path_rejects_paths_outside_run_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(ValueError):
+                safe_run_path(Path(temp_dir), "../outside.jpg")
+
+    def test_color_histogram_and_similarity_match_same_crop(self) -> None:
+        frame = np.zeros((20, 20, 3), dtype=np.uint8)
+        frame[:, :] = [10, 120, 240]
+        box = BoundingBox(0, 0, 20, 20)
+
+        histogram = color_histogram(frame, box)
+
+        self.assertAlmostEqual(sum(histogram), 1.0)
+        self.assertAlmostEqual(cosine_similarity(histogram, histogram), 1.0)
+
+    def test_observation_identity_scores_consistent_shape_and_color(self) -> None:
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        frame[10:30, 10:50] = [200, 200, 200]
+        first = observation_from_box(
+            frame=frame,
+            frame_index=0,
+            timestamp_sec=0,
+            track_id=1,
+            label="car",
+            confidence=0.9,
+            box=BoundingBox(10, 10, 50, 30),
+        )
+        second = observation_from_box(
+            frame=frame,
+            frame_index=1,
+            timestamp_sec=1,
+            track_id=1,
+            label="car",
+            confidence=0.9,
+            box=BoundingBox(12, 10, 52, 30),
+            previous=first,
+        )
+
+        self.assertIsNotNone(second.identity_score)
+        self.assertGreater(second.identity_score, 0.9)
+        self.assertGreater(identity_score(1.0, 1.0), 0.99)
+
+    def test_track_video_rejects_invalid_resize_width(self) -> None:
+        with self.assertRaises(ValueError):
+            track_video(
+                Path("missing.mp4"),
+                profile="vehicles",
+                out_dir=Path("tracking_runs/test"),
+                resize_width=0,
+            )
 
 
 if __name__ == "__main__":

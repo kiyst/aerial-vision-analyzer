@@ -439,7 +439,7 @@ def render_review_html(report: dict[str, object]) -> str:
           <button type="button" data-action="unreviewed" title="Mark selected event as unreviewed">Unreviewed</button>
           <button type="button" data-action="confirmed" title="Confirm selected event">Confirm</button>
           <button type="button" data-action="dismissed" title="Dismiss selected event">Dismiss</button>
-          <button type="button" id="exportDecisions" title="Download review_decisions.json">Export JSON</button>
+          <button type="button" id="downloadReview" title="Download review.html and review_decisions.json">Download</button>
         </div>
       </header>
       <section id="viewer" class="viewer">
@@ -463,7 +463,7 @@ def render_review_html(report: dict[str, object]) -> str:
     const eventTitle = document.getElementById("eventTitle");
     const labelFilter = document.getElementById("labelFilter");
     const statusFilter = document.getElementById("statusFilter");
-    const exportDecisions = document.getElementById("exportDecisions");
+    const downloadReview = document.getElementById("downloadReview");
 
     function eventId(event) {{
       return String(event.timestamp_sec ?? event.timestamp ?? event.frame_index);
@@ -528,17 +528,36 @@ def render_review_html(report: dict[str, object]) -> str:
       }};
     }}
 
-    function downloadReviewDecisions() {{
-      const payload = buildDecisionPayload();
-      const blob = new Blob([JSON.stringify(payload, null, 2) + "\\n"], {{ type: "application/json" }});
+    function downloadBlob(filename, content, type) {{
+      const blob = new Blob([content], {{ type }});
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = "review_decisions.json";
+      link.download = filename;
       document.body.appendChild(link);
       link.click();
       link.remove();
       URL.revokeObjectURL(url);
+    }}
+
+    function buildReviewHtmlSnapshot() {{
+      let source = "<!doctype html>\\n" + document.documentElement.outerHTML;
+      const statusScript = `let statusStore = ${{JSON.stringify(statusStore)}};`;
+      source = source.replace(
+        /let statusStore = \\{{\\}};\\s*try \\{{[\\s\\S]*?\\}} catch \\(error\\) \\{{\\s*statusStore = \\{{\\}};\\s*\\}}/,
+        statusScript
+      );
+      return source;
+    }}
+
+    function downloadReviewDecisions() {{
+      const payload = buildDecisionPayload();
+      downloadBlob("review_decisions.json", JSON.stringify(payload, null, 2) + "\\n", "application/json");
+    }}
+
+    function downloadReviewPackage() {{
+      downloadReviewDecisions();
+      downloadBlob("review.html", buildReviewHtmlSnapshot(), "text/html");
     }}
 
     function labels() {{
@@ -676,7 +695,7 @@ def render_review_html(report: dict[str, object]) -> str:
     }});
     labelFilter.addEventListener("change", render);
     statusFilter.addEventListener("change", render);
-    exportDecisions.addEventListener("click", downloadReviewDecisions);
+    downloadReview.addEventListener("click", downloadReviewPackage);
     document.addEventListener("keydown", event => {{
       const tagName = event.target?.tagName;
       if (tagName === "SELECT" || tagName === "INPUT" || tagName === "TEXTAREA") return;
@@ -702,6 +721,9 @@ def render_review_html(report: dict[str, object]) -> str:
       }} else if (event.key.toLowerCase() === "e") {{
         event.preventDefault();
         setStatus("unreviewed");
+      }} else if (event.key.toLowerCase() === "d") {{
+        event.preventDefault();
+        downloadReviewPackage();
       }}
     }});
 

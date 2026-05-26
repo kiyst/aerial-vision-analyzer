@@ -5,6 +5,7 @@ __pycache__/
 *.egg-info/
 outputs/
 field_runs/
+tracking_runs/
 videos/
 models/
 *.pt
