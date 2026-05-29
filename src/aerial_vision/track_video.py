@@ -52,6 +52,43 @@ class TrackObservation:
         }
 
 
+@dataclass(frozen=True)
+class TargetLockObservation:
+    frame_index: int
+    timestamp_sec: float
+    target_id: int
+    state: str
+    reason: str
+    center_offset: tuple[float, float] | None
+    normalized_offset: tuple[float, float] | None
+    box: BoundingBox | None
+    confidence: float | None
+    identity_score: float | None
+    overlap_risk: float
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "frame_index": self.frame_index,
+            "timestamp_sec": self.timestamp_sec,
+            "target_id": self.target_id,
+            "state": self.state,
+            "reason": self.reason,
+            "center_offset": self.center_offset,
+            "normalized_offset": self.normalized_offset,
+            "box": None
+            if self.box is None
+            else {
+                "x_min": self.box.x_min,
+                "y_min": self.box.y_min,
+                "x_max": self.box.x_max,
+                "y_max": self.box.y_max,
+            },
+            "confidence": self.confidence,
+            "identity_score": self.identity_score,
+            "overlap_risk": self.overlap_risk,
+        }
+
+
 def prepare_tracking_dir(out_dir: Path) -> None:
     if out_dir.exists():
         shutil.rmtree(out_dir)
@@ -102,6 +139,181 @@ def shape_similarity(current: TrackObservation, previous: TrackObservation) -> f
 
 def identity_score(color_score: float, shape_score: float) -> float:
     return 0.65 * color_score + 0.35 * shape_score
+
+
+def bbox_iou(first: BoundingBox, second: BoundingBox) -> float:
+    x_min = max(first.x_min, second.x_min)
+    y_min = max(first.y_min, second.y_min)
+    x_max = min(first.x_max, second.x_max)
+    y_max = min(first.y_max, second.y_max)
+    intersection_width = max(0.0, x_max - x_min)
+    intersection_height = max(0.0, y_max - y_min)
+    intersection_area = intersection_width * intersection_height
+    union_area = first.area + second.area - intersection_area
+    if union_area <= 0:
+        return 0.0
+    return intersection_area / union_area
+
+
+def target_center_offsets(observation: TrackObservation, *, frame_width: int, frame_height: int) -> tuple[tuple[float, float], tuple[float, float]]:
+    frame_center_x = frame_width / 2
+    frame_center_y = frame_height / 2
+    offset_x = observation.center[0] - frame_center_x
+    offset_y = observation.center[1] - frame_center_y
+    return (
+        (offset_x, offset_y),
+        (offset_x / frame_center_x, offset_y / frame_center_y),
+    )
+
+
+def max_same_label_overlap(target: TrackObservation, observations: list[TrackObservation]) -> float:
+    overlaps = [
+        bbox_iou(target.box, observation.box)
+        for observation in observations
+        if observation.track_id != target.track_id and normalize_label(observation.label) == normalize_label(target.label)
+    ]
+    return max(overlaps, default=0.0)
+
+
+def points_for_box(box: BoundingBox, *, frame_width: int, frame_height: int, grid_size: int = 5) -> np.ndarray:
+    x_min, y_min, x_max, y_max = clamp_box(box, width=frame_width, height=frame_height)
+    if x_max <= x_min or y_max <= y_min:
+        return np.empty((0, 1, 2), dtype=np.float32)
+
+    x_padding = max(1, int((x_max - x_min) * 0.15))
+    y_padding = max(1, int((y_max - y_min) * 0.15))
+    x_values = np.linspace(x_min + x_padding, x_max - x_padding, grid_size)
+    y_values = np.linspace(y_min + y_padding, y_max - y_padding, grid_size)
+    points = [[x, y] for y in y_values for x in x_values]
+    return np.array(points, dtype=np.float32).reshape(-1, 1, 2)
+
+
+def shifted_box_from_points(
+    previous_box: BoundingBox,
+    previous_points: np.ndarray,
+    current_points: np.ndarray,
+    *,
+    frame_width: int,
+    frame_height: int,
+) -> BoundingBox:
+    deltas = current_points.reshape(-1, 2) - previous_points.reshape(-1, 2)
+    dx = float(np.median(deltas[:, 0]))
+    dy = float(np.median(deltas[:, 1]))
+    x_min = max(0.0, min(frame_width, previous_box.x_min + dx))
+    y_min = max(0.0, min(frame_height, previous_box.y_min + dy))
+    x_max = max(0.0, min(frame_width, previous_box.x_max + dx))
+    y_max = max(0.0, min(frame_height, previous_box.y_max + dy))
+    return BoundingBox(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max)
+
+
+def optical_flow_observation(
+    *,
+    previous_gray: np.ndarray,
+    current_gray: np.ndarray,
+    current_frame: np.ndarray,
+    previous_observation: TrackObservation,
+    frame_index: int,
+    timestamp_sec: float,
+    min_points: int = 6,
+) -> TrackObservation | None:
+    import cv2
+
+    previous_points = points_for_box(
+        previous_observation.box,
+        frame_width=previous_gray.shape[1],
+        frame_height=previous_gray.shape[0],
+    )
+    if len(previous_points) < min_points:
+        return None
+
+    current_points, status, _ = cv2.calcOpticalFlowPyrLK(
+        previous_gray,
+        current_gray,
+        previous_points,
+        None,
+        winSize=(21, 21),
+        maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+    )
+    if current_points is None or status is None:
+        return None
+
+    valid = status.reshape(-1) == 1
+    if int(valid.sum()) < min_points:
+        return None
+
+    box = shifted_box_from_points(
+        previous_observation.box,
+        previous_points[valid],
+        current_points[valid],
+        frame_width=current_gray.shape[1],
+        frame_height=current_gray.shape[0],
+    )
+    return observation_from_box(
+        frame=current_frame,
+        frame_index=frame_index,
+        timestamp_sec=timestamp_sec,
+        track_id=previous_observation.track_id,
+        label=previous_observation.label,
+        confidence=max(0.0, previous_observation.confidence * 0.98),
+        box=box,
+        previous=previous_observation,
+    )
+
+
+def target_lock_state(
+    target: TrackObservation | None,
+    observations: list[TrackObservation],
+    *,
+    target_id: int,
+    frame_index: int,
+    timestamp_sec: float,
+    frame_width: int,
+    frame_height: int,
+    identity_threshold: float = 0.65,
+    overlap_threshold: float = 0.25,
+) -> TargetLockObservation:
+    if target is None:
+        return TargetLockObservation(
+            frame_index=frame_index,
+            timestamp_sec=timestamp_sec,
+            target_id=target_id,
+            state="lost",
+            reason="target track not present in this frame",
+            center_offset=None,
+            normalized_offset=None,
+            box=None,
+            confidence=None,
+            identity_score=None,
+            overlap_risk=0.0,
+        )
+
+    center_offset, normalized_offset = target_center_offsets(target, frame_width=frame_width, frame_height=frame_height)
+    overlap_risk = max_same_label_overlap(target, observations)
+    score = target.identity_score
+    state = "locked"
+    reason = "target visible"
+
+    if score is not None and score < identity_threshold:
+        state = "weak_lock"
+        reason = "target appearance changed"
+    if overlap_risk >= overlap_threshold:
+        state = "id_switch_risk" if state == "locked" else state
+        reason = "target overlaps a similar object"
+
+    return TargetLockObservation(
+        frame_index=frame_index,
+        timestamp_sec=timestamp_sec,
+        target_id=target_id,
+        state=state,
+        reason=reason,
+        center_offset=center_offset,
+        normalized_offset=normalized_offset,
+        box=target.box,
+        confidence=target.confidence,
+        identity_score=target.identity_score,
+        overlap_risk=overlap_risk,
+    )
 
 
 def observation_from_box(
@@ -158,6 +370,63 @@ def profile_model_and_classes(profile: str) -> tuple[str, set[str]]:
     return str(config["model"]), {normalize_label(label) for label in config["objects"]}
 
 
+def profile_min_confidence(profile: str) -> float:
+    return float(PROFILE_CONFIGS[profile]["min_confidence"])
+
+
+def class_ids_for_model(model: object, wanted_classes: set[str]) -> list[int] | None:
+    names = getattr(model, "names", None)
+    if names is None:
+        return None
+    items = names.items() if isinstance(names, dict) else enumerate(names)
+    class_ids = [
+        int(class_id)
+        for class_id, label in items
+        if normalize_label(str(label)) in wanted_classes
+    ]
+    return class_ids or None
+
+
+def yolo_track_kwargs(
+    *,
+    tracker: str,
+    class_ids: list[int] | None,
+    min_confidence: float,
+    imgsz: int | None,
+    max_det: int,
+    device: str | None,
+    half: bool,
+) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "persist": True,
+        "tracker": tracker,
+        "verbose": False,
+        "conf": min_confidence,
+        "max_det": max_det,
+    }
+    if class_ids is not None:
+        kwargs["classes"] = class_ids
+    if imgsz is not None:
+        kwargs["imgsz"] = imgsz
+    if device:
+        kwargs["device"] = device
+    if half:
+        kwargs["half"] = True
+    return kwargs
+
+
+def select_target_observation(observations: list[TrackObservation], target_label: str) -> TrackObservation | None:
+    normalized_target = normalize_label(target_label)
+    candidates = [
+        observation
+        for observation in observations
+        if normalize_label(observation.label) == normalized_target
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda observation: (observation.confidence, observation.area_px))
+
+
 def draw_track(frame: np.ndarray, observation: TrackObservation) -> None:
     import cv2
 
@@ -171,6 +440,30 @@ def draw_track(frame: np.ndarray, observation: TrackObservation) -> None:
     cv2.putText(frame, text, (x_min + 3, max(14, y_min - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
 
+def draw_target_lock(frame: np.ndarray, observation: TargetLockObservation) -> None:
+    import cv2
+
+    if observation.box is None:
+        cv2.putText(frame, f"TARGET #{observation.target_id}: LOST", (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+        return
+
+    x_min, y_min, x_max, y_max = clamp_box(observation.box, width=frame.shape[1], height=frame.shape[0])
+    color = (0, 255, 0) if observation.state == "locked" else (0, 165, 255)
+    if observation.state == "lost":
+        color = (0, 0, 255)
+
+    target_center = (int((x_min + x_max) / 2), int((y_min + y_max) / 2))
+    frame_center = (frame.shape[1] // 2, frame.shape[0] // 2)
+    cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), color, 4)
+    cv2.circle(frame, target_center, 6, color, -1)
+    cv2.circle(frame, frame_center, 7, (255, 255, 255), 2)
+    cv2.line(frame, frame_center, target_center, color, 2)
+    score = "n/a" if observation.identity_score is None else f"{observation.identity_score:.2f}"
+    text = f"TARGET #{observation.target_id} {observation.state} score={score}"
+    cv2.rectangle(frame, (16, 12), (min(frame.shape[1], 520), 52), color, -1)
+    cv2.putText(frame, text, (24, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 0), 2)
+
+
 def track_video(
     video_path: Path,
     *,
@@ -180,6 +473,13 @@ def track_video(
     max_frames: int | None = None,
     min_track_frames: int = 3,
     resize_width: int | None = None,
+    target_id: int | None = None,
+    target_label: str | None = None,
+    detect_every: int = 1,
+    imgsz: int | None = None,
+    max_det: int = 100,
+    device: str | None = None,
+    half: bool = False,
     tracker: str = "bytetrack.yaml",
 ) -> dict[str, object]:
     if sample_every_sec < 0:
@@ -188,6 +488,14 @@ def track_video(
         raise ValueError("min_track_frames must be positive.")
     if resize_width is not None and resize_width <= 0:
         raise ValueError("resize_width must be positive.")
+    if detect_every <= 0:
+        raise ValueError("detect_every must be positive.")
+    if detect_every > 1 and target_id is None and target_label is None:
+        raise ValueError("detect_every > 1 requires --target-id or --target-label because only the selected target is tracked between detections.")
+    if imgsz is not None and imgsz <= 0:
+        raise ValueError("imgsz must be positive.")
+    if max_det <= 0:
+        raise ValueError("max_det must be positive.")
 
     try:
         import cv2
@@ -196,6 +504,7 @@ def track_video(
         raise RuntimeError("Tracking requires OpenCV and Ultralytics. Install with: python3 -m pip install -e '.[ml]'") from exc
 
     model_path, wanted_classes = profile_model_and_classes(profile)
+    min_confidence = profile_min_confidence(profile)
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
@@ -226,8 +535,24 @@ def track_video(
         raise RuntimeError(f"Could not write tracking preview: {preview_path}")
 
     model = YOLO(model_path)
+    class_ids = class_ids_for_model(model, wanted_classes)
+    track_kwargs = yolo_track_kwargs(
+        tracker=tracker,
+        class_ids=class_ids,
+        min_confidence=min_confidence,
+        imgsz=imgsz,
+        max_det=max_det,
+        device=device,
+        half=half,
+    )
     previous_by_track: dict[int, TrackObservation] = {}
     observations: list[TrackObservation] = []
+    target_lock_observations: list[TargetLockObservation] = []
+    last_target_observation: TrackObservation | None = None
+    active_target_id = target_id
+    previous_gray: np.ndarray | None = None
+    detector_frames = 0
+    optical_flow_frames = 0
     frames_processed = 0
     frame_index = 0
     start_time = time.perf_counter()
@@ -245,39 +570,81 @@ def track_video(
         process_frame = frame
         if process_width != width or process_height != height:
             process_frame = cv2.resize(frame, (process_width, process_height), interpolation=cv2.INTER_AREA)
+        current_gray = cv2.cvtColor(process_frame, cv2.COLOR_BGR2GRAY)
 
-        results = model.track(process_frame, persist=True, tracker=tracker, verbose=False)
         frame_observations: list[TrackObservation] = []
-        for result in results:
-            boxes = getattr(result, "boxes", None)
-            if boxes is None or boxes.id is None:
-                continue
-
-            for box in boxes:
-                label = result.names[int(box.cls.item())]
-                if normalize_label(label) not in wanted_classes:
+        use_detector = frames_processed % detect_every == 0
+        if use_detector:
+            detector_frames += 1
+            results = model.track(process_frame, **track_kwargs)
+            for result in results:
+                boxes = getattr(result, "boxes", None)
+                if boxes is None or boxes.id is None:
                     continue
 
-                track_id = int(box.id.item())
-                confidence = float(box.conf.item())
-                x_min, y_min, x_max, y_max = [float(value) for value in box.xyxy[0].tolist()]
-                bbox = BoundingBox(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max)
-                observation = observation_from_box(
-                    frame=process_frame,
-                    frame_index=frame_index,
-                    timestamp_sec=frame_index / fps,
-                    track_id=track_id,
-                    label=label,
-                    confidence=confidence,
-                    box=bbox,
-                    previous=previous_by_track.get(track_id),
-                )
-                previous_by_track[track_id] = observation
-                frame_observations.append(observation)
-                observations.append(observation)
-                draw_track(process_frame, observation)
+                for box in boxes:
+                    label = result.names[int(box.cls.item())]
+                    if normalize_label(label) not in wanted_classes:
+                        continue
+
+                    track_id = int(box.id.item())
+                    confidence = float(box.conf.item())
+                    x_min, y_min, x_max, y_max = [float(value) for value in box.xyxy[0].tolist()]
+                    bbox = BoundingBox(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max)
+                    observation = observation_from_box(
+                        frame=process_frame,
+                        frame_index=frame_index,
+                        timestamp_sec=frame_index / fps,
+                        track_id=track_id,
+                        label=label,
+                        confidence=confidence,
+                        box=bbox,
+                        previous=previous_by_track.get(track_id),
+                    )
+                    previous_by_track[track_id] = observation
+                    frame_observations.append(observation)
+                    observations.append(observation)
+                    draw_track(process_frame, observation)
+                    if active_target_id is not None and track_id == active_target_id:
+                        last_target_observation = observation
+
+            if active_target_id is None and target_label is not None:
+                selected = select_target_observation(frame_observations, target_label)
+                if selected is not None:
+                    active_target_id = selected.track_id
+                    last_target_observation = selected
+        elif active_target_id is not None and previous_gray is not None and last_target_observation is not None:
+            optical_flow_frames += 1
+            optical_observation = optical_flow_observation(
+                previous_gray=previous_gray,
+                current_gray=current_gray,
+                current_frame=process_frame,
+                previous_observation=last_target_observation,
+                frame_index=frame_index,
+                timestamp_sec=frame_index / fps,
+            )
+            if optical_observation is not None:
+                last_target_observation = optical_observation
+                previous_by_track[active_target_id] = optical_observation
+                frame_observations.append(optical_observation)
+                observations.append(optical_observation)
+
+        if active_target_id is not None:
+            target = next((observation for observation in frame_observations if observation.track_id == active_target_id), None)
+            lock_observation = target_lock_state(
+                target,
+                frame_observations,
+                target_id=active_target_id,
+                frame_index=frame_index,
+                timestamp_sec=frame_index / fps,
+                frame_width=process_width,
+                frame_height=process_height,
+            )
+            target_lock_observations.append(lock_observation)
+            draw_target_lock(process_frame, lock_observation)
 
         writer.write(process_frame)
+        previous_gray = current_gray
         frames_processed += 1
         frame_index += 1
 
@@ -309,7 +676,17 @@ def track_video(
         "sample_every_sec": sample_every_sec,
         "min_track_frames": min_track_frames,
         "resize_width": resize_width,
+        "requested_target_id": target_id,
+        "target_label": target_label,
+        "selected_target_id": active_target_id,
+        "detect_every": detect_every,
+        "imgsz": imgsz,
+        "max_det": max_det,
+        "device": device,
+        "half": half,
         "frames_processed": frames_processed,
+        "detector_frames": detector_frames,
+        "optical_flow_frames": optical_flow_frames,
         "elapsed_sec": elapsed_sec,
         "processed_fps": frames_processed / elapsed_sec if elapsed_sec > 0 else None,
         "raw_track_count": len(tracks_by_id),
@@ -321,6 +698,30 @@ def track_video(
         },
     }
     (out_dir / "tracks.json").write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
+    if active_target_id is not None:
+        states: dict[str, int] = {}
+        for observation in target_lock_observations:
+            states[observation.state] = states.get(observation.state, 0) + 1
+        target_output = {
+            "target_id": active_target_id,
+            "requested_target_id": target_id,
+            "target_label": target_label,
+            "video": output["video"],
+            "profile": profile,
+            "tracker": tracker,
+            "detect_every": detect_every,
+            "imgsz": imgsz,
+            "max_det": max_det,
+            "device": device,
+            "half": half,
+            "frames_processed": frames_processed,
+            "detector_frames": detector_frames,
+            "optical_flow_frames": optical_flow_frames,
+            "state_counts": states,
+            "observations": [observation.to_dict() for observation in target_lock_observations],
+        }
+        (out_dir / "target_lock.json").write_text(json.dumps(target_output, indent=2) + "\n", encoding="utf-8")
+        output["target_lock"] = "target_lock.json"
     return output
 
 
@@ -333,6 +734,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-frames", type=int, help="Optional limit for quick smoke tests.")
     parser.add_argument("--min-track-frames", type=int, default=3, help="Only export tracks observed for at least this many processed frames.")
     parser.add_argument("--resize-width", type=int, help="Resize frames to this width before tracking. Preserves aspect ratio.")
+    parser.add_argument("--target-id", type=int, help="Highlight and log target-lock state for this track ID.")
+    parser.add_argument("--target-label", help="Automatically lock onto the highest-confidence track with this label, e.g. truck.")
+    parser.add_argument("--detect-every", type=int, default=1, help="Run detector every N processed frames and use optical flow for the target between detections. Requires --target-id or --target-label when greater than 1.")
+    parser.add_argument("--imgsz", type=int, help="YOLO inference image size. Smaller values can improve speed.")
+    parser.add_argument("--max-det", type=int, default=100, help="Maximum detections per detector refresh.")
+    parser.add_argument("--device", help="Ultralytics device, e.g. cpu, mps, 0, cuda:0.")
+    parser.add_argument("--half", action="store_true", help="Use FP16 inference on supported GPU devices.")
     parser.add_argument("--tracker", default="bytetrack.yaml", help="Ultralytics tracker config, e.g. bytetrack.yaml or botsort.yaml.")
     return parser
 
@@ -347,17 +755,28 @@ def main() -> None:
         max_frames=args.max_frames,
         min_track_frames=args.min_track_frames,
         resize_width=args.resize_width,
+        target_id=args.target_id,
+        target_label=args.target_label,
+        detect_every=args.detect_every,
+        imgsz=args.imgsz,
+        max_det=args.max_det,
+        device=args.device,
+        half=args.half,
         tracker=args.tracker,
     )
     print(f"video: {args.video}")
     print(f"profile: {args.profile}")
     print(f"frames_processed: {output['frames_processed']}")
+    print(f"detector_frames: {output['detector_frames']}")
+    print(f"optical_flow_frames: {output['optical_flow_frames']}")
     print(f"elapsed_sec: {output['elapsed_sec']:.1f}")
     if output["processed_fps"] is not None:
         print(f"processed_fps: {output['processed_fps']:.2f}")
     print(f"track_count: {output['track_count']}")
     print(f"processed_size: {output['video']['processed_width_px']} x {output['video']['processed_height_px']}")
     print(f"tracks: {args.out / 'tracks.json'}")
+    if "target_lock" in output:
+        print(f"target_lock: {args.out / output['target_lock']}")
     print(f"preview: {args.out / output['preview_video']}")
 
 

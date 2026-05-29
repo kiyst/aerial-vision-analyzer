@@ -21,6 +21,10 @@ from aerial_vision.detection import (
     filter_detections,
 )
 from aerial_vision.export_review import export_confirmed, safe_run_path
+from aerial_vision.benchmark_live import live_score, parse_int_list, parse_optional_int_list, summarize_result
+from aerial_vision.live_track import observation_contains_point, parse_source, resolve_label_filter, select_observation_at_point
+from aerial_vision.live_source import frame_time_sec, playback_status, realtime_delay_sec, should_drop_frame
+from aerial_vision.pick_target import selected_track_id
 from aerial_vision.pipeline import DetectionSettings, DetectorBundle, analyze_image_with_detectors
 from aerial_vision.scan_video import (
     detection_difference,
@@ -30,7 +34,20 @@ from aerial_vision.scan_video import (
     render_review_html,
     timestamp_display,
 )
-from aerial_vision.track_video import color_histogram, cosine_similarity, identity_score, observation_from_box, track_video
+from aerial_vision.track_video import (
+    class_ids_for_model,
+    color_histogram,
+    cosine_similarity,
+    identity_score,
+    observation_from_box,
+    points_for_box,
+    profile_min_confidence,
+    select_target_observation,
+    target_center_offsets,
+    target_lock_state,
+    track_video,
+    yolo_track_kwargs,
+)
 from aerial_vision.tiling import bbox_iou, generate_tiles, non_max_suppression, shift_detections
 
 
@@ -499,6 +516,244 @@ class DetectionTest(unittest.TestCase):
                 out_dir=Path("tracking_runs/test"),
                 resize_width=0,
             )
+
+    def test_track_video_requires_target_for_sparse_detection(self) -> None:
+        with self.assertRaises(ValueError):
+            track_video(
+                Path("missing.mp4"),
+                profile="vehicles",
+                out_dir=Path("tracking_runs/test"),
+                detect_every=10,
+            )
+
+    def test_class_ids_for_model_maps_requested_names(self) -> None:
+        class Model:
+            names = {0: "person", 1: "car", 2: "truck"}
+
+        self.assertEqual(class_ids_for_model(Model(), {"car", "truck"}), [1, 2])
+
+    def test_yolo_track_kwargs_includes_speed_controls(self) -> None:
+        kwargs = yolo_track_kwargs(
+            tracker="bytetrack.yaml",
+            class_ids=[1, 2],
+            min_confidence=0.2,
+            imgsz=512,
+            max_det=50,
+            device="cpu",
+            half=True,
+        )
+
+        self.assertEqual(kwargs["classes"], [1, 2])
+        self.assertEqual(kwargs["conf"], 0.2)
+        self.assertEqual(kwargs["imgsz"], 512)
+        self.assertEqual(kwargs["max_det"], 50)
+        self.assertEqual(kwargs["device"], "cpu")
+        self.assertTrue(kwargs["half"])
+
+    def test_profile_min_confidence_uses_pipeline_profiles(self) -> None:
+        self.assertEqual(profile_min_confidence("vehicles"), 0.15)
+
+    def test_select_target_observation_prefers_requested_label_confidence(self) -> None:
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        car = observation_from_box(
+            frame=frame,
+            frame_index=0,
+            timestamp_sec=0,
+            track_id=1,
+            label="car",
+            confidence=0.99,
+            box=BoundingBox(0, 0, 10, 10),
+        )
+        weak_truck = observation_from_box(
+            frame=frame,
+            frame_index=0,
+            timestamp_sec=0,
+            track_id=2,
+            label="truck",
+            confidence=0.5,
+            box=BoundingBox(0, 0, 20, 20),
+        )
+        strong_truck = observation_from_box(
+            frame=frame,
+            frame_index=0,
+            timestamp_sec=0,
+            track_id=3,
+            label="truck",
+            confidence=0.8,
+            box=BoundingBox(0, 0, 15, 15),
+        )
+
+        selected = select_target_observation([car, weak_truck, strong_truck], "truck")
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.track_id, 3)
+
+    def test_live_source_frame_time_and_delay(self) -> None:
+        self.assertEqual(frame_time_sec(60, 30), 2.0)
+        self.assertEqual(realtime_delay_sec(video_time_sec=2.0, wall_elapsed_sec=1.25), 0.75)
+        self.assertEqual(realtime_delay_sec(video_time_sec=2.0, wall_elapsed_sec=2.25), 0.0)
+
+    def test_live_source_drop_decision(self) -> None:
+        self.assertFalse(should_drop_frame(video_time_sec=10.0, wall_elapsed_sec=10.4, max_latency_sec=0.5))
+        self.assertTrue(should_drop_frame(video_time_sec=10.0, wall_elapsed_sec=10.6, max_latency_sec=0.5))
+
+    def test_live_source_playback_status_reports_latency(self) -> None:
+        status = playback_status(
+            frame_index=30,
+            fps=30,
+            wall_elapsed_sec=1.25,
+            processed_frames=20,
+            dropped_frames=10,
+        )
+
+        self.assertEqual(status.video_time_sec, 1.0)
+        self.assertEqual(status.latency_sec, 0.25)
+        self.assertAlmostEqual(status.real_time_factor, 0.8)
+        self.assertEqual(status.to_dict()["dropped_frames"], 10)
+
+    def test_live_track_parse_source_accepts_camera_index_or_path(self) -> None:
+        self.assertEqual(parse_source("0"), 0)
+        self.assertEqual(parse_source("videos/highway.mp4"), "videos/highway.mp4")
+
+    def test_live_track_selects_smallest_box_at_clicked_point(self) -> None:
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        large = observation_from_box(
+            frame=frame,
+            frame_index=0,
+            timestamp_sec=0,
+            track_id=1,
+            label="car",
+            confidence=0.8,
+            box=BoundingBox(10, 10, 80, 80),
+        )
+        small = observation_from_box(
+            frame=frame,
+            frame_index=0,
+            timestamp_sec=0,
+            track_id=2,
+            label="truck",
+            confidence=0.8,
+            box=BoundingBox(20, 20, 40, 40),
+        )
+
+        self.assertTrue(observation_contains_point(small, 25, 25))
+        self.assertEqual(select_observation_at_point([large, small], 25, 25), small)
+        self.assertIsNone(select_observation_at_point([large, small], 90, 90))
+
+    def test_live_track_resolves_interactive_label_filter(self) -> None:
+        available = {"car", "truck", "bus"}
+
+        self.assertEqual(resolve_label_filter(available, None), available)
+        self.assertEqual(resolve_label_filter(available, ["all"]), available)
+        self.assertEqual(resolve_label_filter(available, ["Truck", "bus"]), {"truck", "bus"})
+        with self.assertRaises(ValueError):
+            resolve_label_filter(available, ["plane"])
+
+    def test_benchmark_live_parses_comma_lists(self) -> None:
+        self.assertEqual(parse_int_list("10, 15"), [10, 15])
+        self.assertEqual(parse_optional_int_list("native,512"), [None, 512])
+
+    def test_benchmark_live_scores_fast_stable_runs_higher(self) -> None:
+        stable = {
+            "processed_fps": 20.0,
+            "processed_frames": 100,
+            "dropped_frames": 0,
+            "state_counts": {"locked": 95, "lost": 5},
+            "observations": [{} for _ in range(100)],
+        }
+        unstable = {
+            "processed_fps": 20.0,
+            "processed_frames": 100,
+            "dropped_frames": 20,
+            "state_counts": {"locked": 40, "lost": 60},
+            "observations": [{} for _ in range(100)],
+        }
+
+        self.assertGreater(live_score(stable), live_score(unstable))
+        self.assertEqual(summarize_result(stable)["locked_ratio"], 0.95)
+
+    def test_selected_track_id_returns_choice_track_id(self) -> None:
+        choices = [
+            {"choice": 1, "track_id": 10},
+            {"choice": 2, "track_id": 22},
+        ]
+
+        self.assertEqual(selected_track_id(choices, 2), 22)
+        with self.assertRaises(ValueError):
+            selected_track_id(choices, 3)
+
+    def test_points_for_box_generates_grid_inside_box(self) -> None:
+        points = points_for_box(BoundingBox(10, 20, 50, 60), frame_width=100, frame_height=100, grid_size=3)
+
+        self.assertEqual(points.shape, (9, 1, 2))
+        self.assertGreater(float(points[:, :, 0].min()), 10)
+        self.assertLess(float(points[:, :, 0].max()), 50)
+
+    def test_target_center_offsets_are_normalized(self) -> None:
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        observation = observation_from_box(
+            frame=frame,
+            frame_index=0,
+            timestamp_sec=0,
+            track_id=1,
+            label="car",
+            confidence=0.9,
+            box=BoundingBox(60, 40, 80, 60),
+        )
+
+        raw_offset, normalized_offset = target_center_offsets(observation, frame_width=100, frame_height=100)
+
+        self.assertEqual(raw_offset, (20.0, 0.0))
+        self.assertEqual(normalized_offset, (0.4, 0.0))
+
+    def test_target_lock_state_marks_lost_target(self) -> None:
+        lock = target_lock_state(
+            None,
+            [],
+            target_id=7,
+            frame_index=10,
+            timestamp_sec=1.0,
+            frame_width=100,
+            frame_height=100,
+        )
+
+        self.assertEqual(lock.state, "lost")
+        self.assertIsNone(lock.center_offset)
+
+    def test_target_lock_state_marks_overlap_risk(self) -> None:
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        target = observation_from_box(
+            frame=frame,
+            frame_index=0,
+            timestamp_sec=0,
+            track_id=1,
+            label="car",
+            confidence=0.9,
+            box=BoundingBox(10, 10, 50, 50),
+        )
+        nearby = observation_from_box(
+            frame=frame,
+            frame_index=0,
+            timestamp_sec=0,
+            track_id=2,
+            label="car",
+            confidence=0.9,
+            box=BoundingBox(20, 20, 60, 60),
+        )
+
+        lock = target_lock_state(
+            target,
+            [target, nearby],
+            target_id=1,
+            frame_index=0,
+            timestamp_sec=0,
+            frame_width=100,
+            frame_height=100,
+            overlap_threshold=0.1,
+        )
+
+        self.assertEqual(lock.state, "id_switch_risk")
+        self.assertGreater(lock.overlap_risk, 0.1)
 
 
 if __name__ == "__main__":

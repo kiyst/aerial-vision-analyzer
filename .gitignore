@@ -6,6 +6,8 @@ __pycache__/
 outputs/
 field_runs/
 tracking_runs/
+live_runs/
+live_benchmarks/
 videos/
 models/
 *.pt
