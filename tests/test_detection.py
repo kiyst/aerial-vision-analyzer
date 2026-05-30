@@ -59,6 +59,7 @@ from aerial_vision.scan_video import (
 )
 from aerial_vision.track_video import (
     class_ids_for_model,
+    control_intent_from_lock,
     color_histogram,
     cosine_similarity,
     identity_score,
@@ -777,6 +778,125 @@ class DetectionTest(unittest.TestCase):
 
         self.assertEqual(lock.state, "id_switch_risk")
         self.assertGreater(lock.overlap_risk, 0.1)
+
+    def test_control_intent_tracks_visible_offset(self) -> None:
+        lock = type(
+            "Lock",
+            (),
+            {
+                "frame_index": 1,
+                "timestamp_sec": 0.1,
+                "state": "locked",
+                "reason": "target visible",
+                "normalized_offset": (0.5, -0.25),
+            },
+        )()
+
+        intent = control_intent_from_lock(lock, max_yaw_rate_deg_s=40, max_pitch_rate_deg_s=20)
+
+        self.assertEqual(intent.mode, "center")
+        self.assertAlmostEqual(intent.yaw_rate_deg_s, 20.0)
+        self.assertAlmostEqual(intent.camera_pitch_rate_deg_s, -5.0)
+        self.assertEqual(intent.forward_mps, 0.0)
+
+    def test_control_intent_holds_position_when_centered_without_tag(self) -> None:
+        lock = type(
+            "Lock",
+            (),
+            {
+                "frame_index": 1,
+                "timestamp_sec": 0.1,
+                "state": "locked",
+                "reason": "target visible",
+                "normalized_offset": (0.02, 0.02),
+            },
+        )()
+
+        intent = control_intent_from_lock(lock, max_forward_mps=5.0, center_deadband=0.08)
+
+        self.assertEqual(intent.mode, "centered")
+        self.assertEqual(intent.forward_mps, 0.0)
+
+    def test_control_intent_follows_when_target_appears_to_move_away(self) -> None:
+        lock = type(
+            "Lock",
+            (),
+            {
+                "frame_index": 1,
+                "timestamp_sec": 0.1,
+                "state": "locked",
+                "reason": "target visible",
+                "normalized_offset": (0.03, 0.02),
+                "box": BoundingBox(0, 0, 90, 90),
+            },
+        )()
+
+        intent = control_intent_from_lock(
+            lock,
+            previous_box_area=10000,
+            follow_forward_mps=2.5,
+            follow_center_gate=0.35,
+        )
+
+        self.assertEqual(intent.mode, "follow")
+        self.assertEqual(intent.forward_mps, 2.5)
+
+    def test_control_intent_tag_allows_forward_when_centered(self) -> None:
+        lock = type(
+            "Lock",
+            (),
+            {
+                "frame_index": 1,
+                "timestamp_sec": 0.1,
+                "state": "locked",
+                "reason": "target visible",
+                "normalized_offset": (0.02, 0.02),
+                "box": BoundingBox(0, 0, 100, 100),
+            },
+        )()
+
+        intent = control_intent_from_lock(lock, tag_enabled=True, max_forward_mps=5.0)
+
+        self.assertEqual(intent.mode, "tag")
+        self.assertGreater(intent.forward_mps, 0.0)
+        self.assertTrue(intent.tag_enabled)
+
+    def test_control_intent_searches_last_known_side_when_lost(self) -> None:
+        lock = type(
+            "Lock",
+            (),
+            {
+                "frame_index": 1,
+                "timestamp_sec": 0.1,
+                "state": "lost",
+                "reason": "target missing",
+                "normalized_offset": None,
+            },
+        )()
+
+        intent = control_intent_from_lock(lock, previous_offset=(-0.4, 0.0), search_yaw_rate_deg_s=12)
+
+        self.assertEqual(intent.mode, "search")
+        self.assertEqual(intent.yaw_rate_deg_s, -12)
+        self.assertEqual(intent.forward_mps, 0.0)
+
+    def test_control_intent_holds_on_identity_risk(self) -> None:
+        lock = type(
+            "Lock",
+            (),
+            {
+                "frame_index": 1,
+                "timestamp_sec": 0.1,
+                "state": "id_switch_risk",
+                "reason": "target overlaps a similar object",
+                "normalized_offset": (0.01, 0.01),
+            },
+        )()
+
+        intent = control_intent_from_lock(lock, max_forward_mps=5.0, center_deadband=0.08)
+
+        self.assertEqual(intent.mode, "hold")
+        self.assertEqual(intent.forward_mps, 0.0)
 
     def test_control_sim_observes_target_in_camera_view(self) -> None:
         config = SimConfig(tracking_noise=0.0, confidence_noise=0.0)

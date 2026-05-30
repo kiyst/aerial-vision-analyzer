@@ -581,6 +581,7 @@ Controls:
 
 ```text
 left click a detected box   select or switch active target
+T                           toggle tag mode for the selected target
 Space                       show dense boxes again for switching
 C                           clear target and return to selection mode
 Q                           quit
@@ -590,7 +591,9 @@ Interactive selection intentionally runs the detector on every displayed frame
 only while choosing a target. After you click a target, it switches back to the
 faster detector-plus-optical-flow tracking path. Press `Space` to show the
 dense selectable boxes again if you want to switch targets. The selected target
-is drawn green; other selectable boxes are yellow.
+is drawn green; other selectable boxes are yellow. Tag mode is a separate
+operator action: normal selection centers and keeps the target framed, while
+`T` enables higher-function tag intent for the selected target.
 
 Useful performance flags:
 
@@ -822,3 +825,49 @@ Run tests:
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
+
+## Target Control Intent
+
+When tracking a selected target in video, the tracker also writes a controller
+intent log. This does not control a drone. It records what a controller would
+ask for if connected later:
+
+```bash
+PYTHONPATH=src python3 -m aerial_vision.track_video videos/highway.mp4 \
+  --profile vehicles \
+  --out tracking_runs/control_intent_highway \
+  --target-label truck \
+  --resize-width 640 \
+  --imgsz 512 \
+  --detect-every 5
+```
+
+Outputs:
+
+```text
+tracking_runs/control_intent_highway/
+  tracked_preview.mp4
+  tracks.json
+  target_lock.json
+  control_intent.json
+```
+
+`control_intent.json` contains one row per processed frame:
+
+```text
+mode: center | centered | follow | tag | hold | search
+yaw_rate_deg_s
+camera_pitch_rate_deg_s
+forward_mps
+center_error
+normalized_offset
+tag_enabled
+box_area_ratio
+```
+
+The current preview video overlays the selected target and the intent values.
+Normal selected-target mode does not move toward the object. It centers the
+camera, and only emits low forward `follow` intent when the selected target is
+reasonably framed but its box is shrinking, which suggests it is moving away.
+`--tag-mode` or the live `T` key enables the higher-function `tag` intent.
+Identity-risk frames use `hold`, and missing-target frames use `search`.

@@ -322,6 +322,8 @@ def main() -> None:
     print(f"preview: {args.out / 'tracking' / track_output['preview_video']}")
     if "target_lock" in track_output:
         print(f"target_lock: {args.out / 'tracking' / track_output['target_lock']}")
+    if "control_intent" in track_output:
+        print(f"control_intent: {args.out / 'tracking' / track_output['control_intent']}")
 
 
 if __name__ == "__main__":

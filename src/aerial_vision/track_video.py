@@ -89,6 +89,36 @@ class TargetLockObservation:
         }
 
 
+@dataclass(frozen=True)
+class ControlIntent:
+    frame_index: int
+    timestamp_sec: float
+    mode: str
+    reason: str
+    yaw_rate_deg_s: float
+    camera_pitch_rate_deg_s: float
+    forward_mps: float
+    normalized_offset: tuple[float, float] | None
+    center_error: float | None
+    tag_enabled: bool
+    box_area_ratio: float | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "frame_index": self.frame_index,
+            "timestamp_sec": self.timestamp_sec,
+            "mode": self.mode,
+            "reason": self.reason,
+            "yaw_rate_deg_s": self.yaw_rate_deg_s,
+            "camera_pitch_rate_deg_s": self.camera_pitch_rate_deg_s,
+            "forward_mps": self.forward_mps,
+            "normalized_offset": self.normalized_offset,
+            "center_error": self.center_error,
+            "tag_enabled": self.tag_enabled,
+            "box_area_ratio": self.box_area_ratio,
+        }
+
+
 def prepare_tracking_dir(out_dir: Path) -> None:
     if out_dir.exists():
         shutil.rmtree(out_dir)
@@ -316,6 +346,95 @@ def target_lock_state(
     )
 
 
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def control_intent_from_lock(
+    observation: TargetLockObservation,
+    *,
+    previous_offset: tuple[float, float] | None = None,
+    previous_box_area: float | None = None,
+    tag_enabled: bool = False,
+    max_yaw_rate_deg_s: float = 35.0,
+    max_pitch_rate_deg_s: float = 25.0,
+    max_forward_mps: float = 6.0,
+    follow_forward_mps: float = 2.0,
+    center_deadband: float = 0.08,
+    follow_center_gate: float = 0.35,
+    tag_center_gate: float = 0.45,
+    away_area_ratio_threshold: float = 0.97,
+    search_yaw_rate_deg_s: float = 18.0,
+) -> ControlIntent:
+    if observation.normalized_offset is None:
+        search_direction = 1.0
+        if previous_offset is not None and abs(previous_offset[0]) > 0.05:
+            search_direction = 1.0 if previous_offset[0] > 0 else -1.0
+        return ControlIntent(
+            frame_index=observation.frame_index,
+            timestamp_sec=observation.timestamp_sec,
+            mode="search",
+            reason="target not visible; rotate toward last known horizontal side",
+            yaw_rate_deg_s=search_direction * search_yaw_rate_deg_s,
+            camera_pitch_rate_deg_s=0.0,
+            forward_mps=0.0,
+            normalized_offset=None,
+            center_error=None,
+            tag_enabled=tag_enabled,
+            box_area_ratio=None,
+        )
+
+    offset_x, offset_y = observation.normalized_offset
+    center_error = float((offset_x * offset_x + offset_y * offset_y) ** 0.5)
+    yaw_rate = clamp(offset_x * max_yaw_rate_deg_s, -max_yaw_rate_deg_s, max_yaw_rate_deg_s)
+    pitch_rate = clamp(offset_y * max_pitch_rate_deg_s, -max_pitch_rate_deg_s, max_pitch_rate_deg_s)
+    box = getattr(observation, "box", None)
+    box_area = box.area if box is not None else None
+    box_area_ratio = None
+    if box_area is not None and previous_box_area is not None and previous_box_area > 0:
+        box_area_ratio = box_area / previous_box_area
+
+    mode = "center"
+    reason = "target visible; center camera on selected target"
+    forward = 0.0
+    if observation.state in {"weak_lock", "id_switch_risk"}:
+        mode = "hold"
+        reason = observation.reason
+    elif tag_enabled:
+        mode = "tag"
+        reason = "tag mode active; target centered enough for forward intent"
+        if center_error <= tag_center_gate:
+            forward = max_forward_mps * max(0.0, 1.0 - center_error / max(tag_center_gate, 1e-6))
+        else:
+            forward = 0.0
+            reason = "tag mode active; center target before forward intent"
+    elif (
+        box_area_ratio is not None
+        and box_area_ratio < away_area_ratio_threshold
+        and center_error <= follow_center_gate
+    ):
+        mode = "follow"
+        reason = "target appears to be moving away; keep it framed"
+        forward = follow_forward_mps
+    elif center_error <= center_deadband:
+        mode = "centered"
+        reason = "target centered; hold position"
+
+    return ControlIntent(
+        frame_index=observation.frame_index,
+        timestamp_sec=observation.timestamp_sec,
+        mode=mode,
+        reason=reason,
+        yaw_rate_deg_s=yaw_rate,
+        camera_pitch_rate_deg_s=pitch_rate,
+        forward_mps=forward,
+        normalized_offset=observation.normalized_offset,
+        center_error=center_error,
+        tag_enabled=tag_enabled,
+        box_area_ratio=box_area_ratio,
+    )
+
+
 def observation_from_box(
     *,
     frame: np.ndarray,
@@ -464,6 +583,25 @@ def draw_target_lock(frame: np.ndarray, observation: TargetLockObservation) -> N
     cv2.putText(frame, text, (24, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 0), 2)
 
 
+def draw_control_intent(frame: np.ndarray, intent: ControlIntent) -> None:
+    import cv2
+
+    color = (80, 220, 80)
+    if intent.mode == "search":
+        color = (0, 165, 255)
+    if intent.mode == "hold":
+        color = (0, 0, 255)
+    if intent.mode == "tag":
+        color = (255, 120, 30)
+
+    tag = " TAG" if intent.tag_enabled else ""
+    line_1 = f"INTENT {intent.mode.upper()}{tag} yaw={intent.yaw_rate_deg_s:+.1f} pitch={intent.camera_pitch_rate_deg_s:+.1f}"
+    line_2 = f"forward={intent.forward_mps:.1f} m/s"
+    cv2.rectangle(frame, (16, 58), (min(frame.shape[1], 600), 112), color, -1)
+    cv2.putText(frame, line_1, (24, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 2)
+    cv2.putText(frame, line_2, (24, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 2)
+
+
 def track_video(
     video_path: Path,
     *,
@@ -481,6 +619,12 @@ def track_video(
     device: str | None = None,
     half: bool = False,
     tracker: str = "bytetrack.yaml",
+    max_intent_yaw_rate_deg_s: float = 35.0,
+    max_intent_pitch_rate_deg_s: float = 25.0,
+    max_intent_forward_mps: float = 6.0,
+    follow_intent_forward_mps: float = 2.0,
+    intent_center_deadband: float = 0.08,
+    tag_mode: bool = False,
 ) -> dict[str, object]:
     if sample_every_sec < 0:
         raise ValueError("sample_every_sec cannot be negative.")
@@ -548,7 +692,10 @@ def track_video(
     previous_by_track: dict[int, TrackObservation] = {}
     observations: list[TrackObservation] = []
     target_lock_observations: list[TargetLockObservation] = []
+    control_intents: list[ControlIntent] = []
     last_target_observation: TrackObservation | None = None
+    last_target_offset: tuple[float, float] | None = None
+    last_target_box_area: float | None = None
     active_target_id = target_id
     previous_gray: np.ndarray | None = None
     detector_frames = 0
@@ -642,6 +789,23 @@ def track_video(
             )
             target_lock_observations.append(lock_observation)
             draw_target_lock(process_frame, lock_observation)
+            intent = control_intent_from_lock(
+                lock_observation,
+                previous_offset=last_target_offset,
+                previous_box_area=last_target_box_area,
+                tag_enabled=tag_mode,
+                max_yaw_rate_deg_s=max_intent_yaw_rate_deg_s,
+                max_pitch_rate_deg_s=max_intent_pitch_rate_deg_s,
+                max_forward_mps=max_intent_forward_mps,
+                follow_forward_mps=follow_intent_forward_mps,
+                center_deadband=intent_center_deadband,
+            )
+            control_intents.append(intent)
+            draw_control_intent(process_frame, intent)
+            if lock_observation.normalized_offset is not None:
+                last_target_offset = lock_observation.normalized_offset
+            if lock_observation.box is not None:
+                last_target_box_area = lock_observation.box.area
 
         writer.write(process_frame)
         previous_gray = current_gray
@@ -719,9 +883,27 @@ def track_video(
             "optical_flow_frames": optical_flow_frames,
             "state_counts": states,
             "observations": [observation.to_dict() for observation in target_lock_observations],
+            "control_intents": [intent.to_dict() for intent in control_intents],
         }
         (out_dir / "target_lock.json").write_text(json.dumps(target_output, indent=2) + "\n", encoding="utf-8")
         output["target_lock"] = "target_lock.json"
+        intent_output = {
+            "target_id": active_target_id,
+            "video": output["video"],
+            "profile": profile,
+            "frames_processed": frames_processed,
+            "intent_settings": {
+                "max_yaw_rate_deg_s": max_intent_yaw_rate_deg_s,
+                "max_pitch_rate_deg_s": max_intent_pitch_rate_deg_s,
+                "max_forward_mps": max_intent_forward_mps,
+                "follow_forward_mps": follow_intent_forward_mps,
+                "center_deadband": intent_center_deadband,
+                "tag_mode": tag_mode,
+            },
+            "intents": [intent.to_dict() for intent in control_intents],
+        }
+        (out_dir / "control_intent.json").write_text(json.dumps(intent_output, indent=2) + "\n", encoding="utf-8")
+        output["control_intent"] = "control_intent.json"
     return output
 
 
@@ -742,6 +924,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", help="Ultralytics device, e.g. cpu, mps, 0, cuda:0.")
     parser.add_argument("--half", action="store_true", help="Use FP16 inference on supported GPU devices.")
     parser.add_argument("--tracker", default="bytetrack.yaml", help="Ultralytics tracker config, e.g. bytetrack.yaml or botsort.yaml.")
+    parser.add_argument("--max-intent-yaw-rate-deg-s", type=float, default=35.0, help="Maximum yaw-rate intent written to control_intent.json.")
+    parser.add_argument("--max-intent-pitch-rate-deg-s", type=float, default=25.0, help="Maximum camera pitch-rate intent written to control_intent.json.")
+    parser.add_argument("--max-intent-forward-mps", type=float, default=6.0, help="Maximum forward-speed intent written to control_intent.json.")
+    parser.add_argument("--follow-intent-forward-mps", type=float, default=2.0, help="Forward-speed intent used only to keep a non-tag target framed when it appears to move away.")
+    parser.add_argument("--intent-center-deadband", type=float, default=0.08, help="Normalized center error below which forward approach intent is allowed.")
+    parser.add_argument("--tag-mode", action="store_true", help="Allow higher-function tag movement intent for the selected target.")
     return parser
 
 
@@ -763,6 +951,12 @@ def main() -> None:
         device=args.device,
         half=args.half,
         tracker=args.tracker,
+        max_intent_yaw_rate_deg_s=args.max_intent_yaw_rate_deg_s,
+        max_intent_pitch_rate_deg_s=args.max_intent_pitch_rate_deg_s,
+        max_intent_forward_mps=args.max_intent_forward_mps,
+        follow_intent_forward_mps=args.follow_intent_forward_mps,
+        intent_center_deadband=args.intent_center_deadband,
+        tag_mode=args.tag_mode,
     )
     print(f"video: {args.video}")
     print(f"profile: {args.profile}")
@@ -777,6 +971,8 @@ def main() -> None:
     print(f"tracks: {args.out / 'tracks.json'}")
     if "target_lock" in output:
         print(f"target_lock: {args.out / output['target_lock']}")
+    if "control_intent" in output:
+        print(f"control_intent: {args.out / output['control_intent']}")
     print(f"preview: {args.out / output['preview_video']}")
 
 

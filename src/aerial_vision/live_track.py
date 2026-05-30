@@ -10,10 +10,13 @@ from aerial_vision.detection import BoundingBox, normalize_label
 from aerial_vision.live_source import playback_status, realtime_delay_sec, should_drop_frame
 from aerial_vision.pipeline import PROFILE_CONFIGS
 from aerial_vision.track_video import (
+    ControlIntent,
     TargetLockObservation,
     TrackObservation,
     class_ids_for_model,
     clamp_box,
+    control_intent_from_lock,
+    draw_control_intent,
     draw_target_lock,
     observation_from_box,
     optical_flow_observation,
@@ -105,6 +108,11 @@ def live_track(
     device: str | None = None,
     half: bool = False,
     tracker: str = "bytetrack.yaml",
+    max_intent_yaw_rate_deg_s: float = 35.0,
+    max_intent_pitch_rate_deg_s: float = 25.0,
+    max_intent_forward_mps: float = 6.0,
+    follow_intent_forward_mps: float = 2.0,
+    intent_center_deadband: float = 0.08,
 ) -> dict[str, object]:
     if detect_every <= 0:
         raise ValueError("detect_every must be positive.")
@@ -163,8 +171,12 @@ def live_track(
 
     previous_by_track: dict[int, TrackObservation] = {}
     target_lock_observations: list[TargetLockObservation] = []
+    control_intents: list[ControlIntent] = []
     last_target_observation: TrackObservation | None = None
+    last_target_offset: tuple[float, float] | None = None
+    last_target_box_area: float | None = None
     active_target_id = target_id
+    tag_mode = False
     latest_detector_observations: list[TrackObservation] = []
     target_switches: list[dict[str, object]] = []
     pending_click: tuple[int, int] | None = None
@@ -321,6 +333,23 @@ def live_track(
             )
             target_lock_observations.append(lock_observation)
             draw_target_lock(process_frame, lock_observation)
+            intent = control_intent_from_lock(
+                lock_observation,
+                previous_offset=last_target_offset,
+                previous_box_area=last_target_box_area,
+                tag_enabled=tag_mode,
+                max_yaw_rate_deg_s=max_intent_yaw_rate_deg_s,
+                max_pitch_rate_deg_s=max_intent_pitch_rate_deg_s,
+                max_forward_mps=max_intent_forward_mps,
+                follow_forward_mps=follow_intent_forward_mps,
+                center_deadband=intent_center_deadband,
+            )
+            control_intents.append(intent)
+            draw_control_intent(process_frame, intent)
+            if lock_observation.normalized_offset is not None:
+                last_target_offset = lock_observation.normalized_offset
+            if lock_observation.box is not None:
+                last_target_box_area = lock_observation.box.area
 
         if display:
             if interactive_select and selection_mode:
@@ -349,9 +378,10 @@ def live_track(
                 2,
             )
             if interactive_select:
-                instruction = "click target to select/switch | space boxes | c clear | q quit"
+                instruction = "click target | t tag | space boxes | c clear | q quit"
                 if active_target_id is not None:
-                    instruction = f"target #{active_target_id} | " + instruction
+                    tag_text = "TAG ON" if tag_mode else "tag off"
+                    instruction = f"target #{active_target_id} {tag_text} | " + instruction
                 cv2.putText(
                     process_frame,
                     instruction,
@@ -371,7 +401,21 @@ def live_track(
             if interactive_select and key == ord("c"):
                 active_target_id = None
                 last_target_observation = None
+                last_target_offset = None
+                last_target_box_area = None
+                tag_mode = False
                 selection_mode = True
+            if interactive_select and key == ord("t") and active_target_id is not None:
+                tag_mode = not tag_mode
+                target_switches.append(
+                    {
+                        "frame_index": frame_index,
+                        "timestamp_sec": video_time,
+                        "target_id": active_target_id,
+                        "method": "tag_toggle",
+                        "tag_mode": tag_mode,
+                    }
+                )
 
         previous_gray = current_gray
         processed_frames += 1
@@ -401,6 +445,7 @@ def live_track(
         "select_labels": sorted(wanted_classes),
         "interactive_select": interactive_select,
         "target_switches": target_switches,
+        "tag_mode": tag_mode,
         "detect_every": detect_every,
         "resize_width": resize_width,
         "imgsz": imgsz,
@@ -424,6 +469,7 @@ def live_track(
         "playback_status": status.to_dict(),
         "state_counts": state_counts,
         "observations": [observation.to_dict() for observation in target_lock_observations],
+        "control_intents": [intent.to_dict() for intent in control_intents],
     }
     (out_dir / "live_session.json").write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
     return output
@@ -450,6 +496,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", help="Ultralytics device, e.g. cpu, mps, 0, cuda:0.")
     parser.add_argument("--half", action="store_true", help="Use FP16 inference on supported GPU devices.")
     parser.add_argument("--tracker", default="bytetrack.yaml", help="Ultralytics tracker config.")
+    parser.add_argument("--max-intent-yaw-rate-deg-s", type=float, default=35.0, help="Maximum yaw-rate intent written to the live session.")
+    parser.add_argument("--max-intent-pitch-rate-deg-s", type=float, default=25.0, help="Maximum camera pitch-rate intent written to the live session.")
+    parser.add_argument("--max-intent-forward-mps", type=float, default=6.0, help="Maximum tag-mode forward-speed intent.")
+    parser.add_argument("--follow-intent-forward-mps", type=float, default=2.0, help="Forward-speed intent used to keep a non-tag target framed when it appears to move away.")
+    parser.add_argument("--intent-center-deadband", type=float, default=0.08, help="Normalized center error below which the target is considered centered.")
     return parser
 
 
@@ -475,6 +526,11 @@ def main() -> None:
         device=args.device,
         half=args.half,
         tracker=args.tracker,
+        max_intent_yaw_rate_deg_s=args.max_intent_yaw_rate_deg_s,
+        max_intent_pitch_rate_deg_s=args.max_intent_pitch_rate_deg_s,
+        max_intent_forward_mps=args.max_intent_forward_mps,
+        follow_intent_forward_mps=args.follow_intent_forward_mps,
+        intent_center_deadband=args.intent_center_deadband,
     )
     print(f"source: {args.source}")
     print(f"target_id: {output['target_id']}")
@@ -484,6 +540,8 @@ def main() -> None:
     print(f"optical_flow_frames: {output['optical_flow_frames']}")
     print(f"processed_fps: {output['processed_fps']:.2f}" if output["processed_fps"] else "processed_fps: n/a")
     print(f"state_counts: {output['state_counts']}")
+    if output["control_intents"]:
+        print(f"control_intents: {len(output['control_intents'])}")
     print(f"session: {args.out / 'live_session.json'}")
 
 
