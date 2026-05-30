@@ -8,6 +8,7 @@ field_runs/
 tracking_runs/
 live_runs/
 live_benchmarks/
+control_runs/
 videos/
 models/
 *.pt

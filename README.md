@@ -640,6 +640,162 @@ target states and dropped frames. Use `--realtime` when you want to benchmark
 against the source FPS clock and measure frame dropping. Use the default
 fast-loop mode when you want raw tracking throughput.
 
+## 3D Control Simulator
+
+Run a math-only closed-loop simulator before connecting any drone controls:
+
+```bash
+python3 -m aerial_vision.control_sim \
+  --out control_runs/basic_3d \
+  --duration-sec 30 \
+  --latency-ms 250
+```
+
+The simulator creates:
+
+```text
+control_runs/basic_3d/
+  report.json
+  trajectory.csv
+  top_down.png
+  preview.gif
+```
+
+It models:
+
+```text
+moving ground target
+drone x/y/z position
+drone yaw
+pitched camera field of view
+noisy visual observation
+delayed control commands
+target-centering controller
+```
+
+This is not a photorealistic world. It is a closed-loop control sandbox: command
+changes drone position, drone position changes the next camera observation, and
+the controller must keep the target in frame. Use it to test whether control
+logic converges or oscillates under latency before trying PX4, Gazebo, or real
+hardware.
+
+Open `preview.gif` to watch the sim:
+
+```text
+left panel   top-down drone path and target path
+right panel  simulated camera frame with target box and center error
+```
+
+Useful stress-test flags:
+
+```text
+--scenario swerve
+--scenario sharp_turns
+--scenario fast_break
+--latency-ms 500
+--target-speed-mps 6
+--tracking-noise 0.04
+--yaw-gain 1.5
+--pitch-gain 1.1
+--prediction-gain 1.2
+--max-forward-mps 14
+--max-lateral-mps 8
+--reacquire-timeout-sec 2
+--intercept-lookahead-sec 1.2
+--intercept-delay-sec 0.6
+--horizontal-fov-deg 45
+--vertical-fov-deg 30
+```
+
+Scenario grades:
+
+```text
+stable    target stayed visible and close to center
+marginal  mostly usable but not reliable enough for real control
+failed    target was lost too much or too far from center
+```
+
+The simulator also reports:
+
+```text
+lost_events
+reacquired_count
+failed_reacquisition_count
+longest_lost_streak_sec
+average_reacquisition_time_sec
+```
+
+Lost-target behavior:
+
+```text
+1. While visible, the sim estimates target ground position from the camera ray.
+2. It smooths the estimated target velocity to reduce one-frame noise.
+3. If vision is lost briefly, it first uses screen-space prediction.
+4. It runs an appearance-aware re-detection pass in a wider search window.
+5. If the target remains lost and the estimate is close enough, it steers
+   toward the predicted ground intercept for up to the reacquire timeout.
+```
+
+The intercept gate is based on target speed and distance:
+
+```text
+allowed_distance = intercept_base_distance_m
+                 + estimated_target_speed_mps * intercept_speed_horizon_sec
+```
+
+Useful lost-target controls:
+
+```text
+--no-intercept
+--intercept-base-distance-m 25
+--intercept-speed-horizon-sec 3
+--intercept-lookahead-sec 1.2
+--intercept-delay-sec 0.6
+--intercept-yaw-gain 2.0
+--intercept-forward-mps 8
+--intercept-velocity-smoothing 0.35
+--max-estimated-target-speed-mps 18
+--no-redetect
+--redetect-fov-multiplier 1.8
+--redetect-min-score 0.68
+--redetect-lookahead-sec 1.0
+--distractor-count 5
+```
+
+Re-detection is deliberately conservative. It scores candidates by predicted
+motion, appearance similarity, and detection confidence so the sim can test the
+same problem real trackers face: keeping the same target identity when similar
+objects are nearby.
+
+Current stress-test read:
+
+```text
+wander:       stable, avg error 0.033, 0 lost frames
+swerve:       stable, avg error 0.051, 0 lost frames
+sharp_turns:  marginal, avg error 0.264, 0 lost frames
+fast_break:   stable, avg error 0.108, 0 lost frames
+```
+
+The current simulator uses gimbal-style camera pitch control plus simple
+latency-aware prediction. That fixed the earlier vertical framing failure in
+fast-break tests, but sharp-turn behavior still has large peak error and should
+be treated as not reliable enough for real control.
+
+Reacquisition stress example:
+
+```bash
+python3 -m aerial_vision.control_sim \
+  --out control_runs/flight_tests/reacquisition_narrow_fov \
+  --scenario sharp_turns \
+  --duration-sec 30 \
+  --latency-ms 700 \
+  --target-speed-mps 8 \
+  --tracking-noise 0.06 \
+  --prediction-gain 1.3 \
+  --horizontal-fov-deg 35 \
+  --vertical-fov-deg 25
+```
+
 This is an early prototype for operator-selected target lock. It does not
 control a drone yet.
 

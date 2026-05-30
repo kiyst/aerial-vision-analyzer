@@ -12,6 +12,29 @@ import aerial_vision.classify as classify_module
 from aerial_vision.analysis import ImageAnalysis
 from aerial_vision.annotate import draw_detections
 from aerial_vision.classify import apply_profile_defaults, clean_previous_outputs
+from aerial_vision.control_sim import (
+    ControlCommand,
+    CandidateObservation,
+    DroneState,
+    SCENARIOS,
+    SimConfig,
+    TargetState,
+    Vec3,
+    appearance_similarity,
+    command_from_intercept,
+    command_from_observation,
+    estimate_ground_position_from_observation,
+    observe_target,
+    reacquisition_metrics,
+    redetection_score,
+    run_simulation,
+    select_redetection_candidate,
+    scenario_grade,
+    scenario_speed_mps,
+    scenario_turn_rate_deg_s,
+    step_drone,
+    step_target,
+)
 from aerial_vision.detection import (
     BoundingBox,
     GeometryRule,
@@ -754,6 +777,288 @@ class DetectionTest(unittest.TestCase):
 
         self.assertEqual(lock.state, "id_switch_risk")
         self.assertGreater(lock.overlap_risk, 0.1)
+
+    def test_control_sim_observes_target_in_camera_view(self) -> None:
+        config = SimConfig(tracking_noise=0.0, confidence_noise=0.0)
+        drone = DroneState(
+            position=Vec3(-35, -35, config.drone_altitude_m),
+            yaw_rad=np.deg2rad(45),
+            camera_pitch_rad=np.deg2rad(config.camera_pitch_deg),
+        )
+        target = TargetState(position=Vec3(0, 0, 0), heading_rad=0.0, speed_mps=0.0)
+
+        observation = observe_target(drone, target, config, __import__("random").Random(1))
+
+        self.assertTrue(observation.visible)
+        self.assertIsNotNone(observation.norm_x)
+        self.assertIsNotNone(observation.norm_y)
+        self.assertGreater(observation.confidence, 0.5)
+
+    def test_control_sim_estimates_ground_position_from_observation(self) -> None:
+        config = SimConfig(tracking_noise=0.0, confidence_noise=0.0)
+        drone = DroneState(
+            position=Vec3(-35, -35, config.drone_altitude_m),
+            yaw_rad=np.deg2rad(45),
+            camera_pitch_rad=np.deg2rad(config.camera_pitch_deg),
+        )
+        target = TargetState(position=Vec3(0, 0, 0), heading_rad=0.0, speed_mps=0.0)
+        observation = observe_target(drone, target, config, __import__("random").Random(1))
+
+        estimated = estimate_ground_position_from_observation(drone, observation, config)
+
+        self.assertIsNotNone(estimated)
+        assert estimated is not None
+        self.assertAlmostEqual(estimated.x, target.position.x, delta=0.01)
+        self.assertAlmostEqual(estimated.y, target.position.y, delta=0.01)
+
+    def test_control_sim_intercept_commands_toward_recent_close_target(self) -> None:
+        config = SimConfig(intercept_base_distance_m=100.0)
+        drone = DroneState(position=Vec3(0, 0, 45), yaw_rad=0.0, camera_pitch_rad=np.deg2rad(-45))
+
+        command = command_from_intercept(
+            drone=drone,
+            estimated_target_position=Vec3(20, 20, 0),
+            estimated_target_velocity=Vec3(2, 0, 0),
+            estimated_target_speed_mps=2,
+            lost_time_sec=0.8,
+            config=config,
+        )
+
+        self.assertIsNotNone(command)
+        assert command is not None
+        self.assertEqual(command.reason, "lost_intercept")
+        self.assertGreater(command.yaw_rate_rad_s, 0)
+        self.assertGreater(command.forward_mps, 0)
+
+    def test_control_sim_intercept_skips_far_or_stale_target(self) -> None:
+        config = SimConfig(intercept_base_distance_m=10.0, intercept_speed_horizon_sec=1.0, reacquire_timeout_sec=1.0)
+        drone = DroneState(position=Vec3(0, 0, 45), yaw_rad=0.0, camera_pitch_rad=np.deg2rad(-45))
+
+        far = command_from_intercept(
+            drone=drone,
+            estimated_target_position=Vec3(100, 0, 0),
+            estimated_target_velocity=Vec3(0, 0, 0),
+            estimated_target_speed_mps=1,
+            lost_time_sec=0.2,
+            config=config,
+        )
+        stale = command_from_intercept(
+            drone=drone,
+            estimated_target_position=Vec3(5, 0, 0),
+            estimated_target_velocity=Vec3(0, 0, 0),
+            estimated_target_speed_mps=1,
+            lost_time_sec=1.2,
+            config=config,
+        )
+
+        self.assertIsNone(far)
+        self.assertIsNone(stale)
+
+    def test_control_sim_appearance_similarity_prefers_matching_target(self) -> None:
+        self.assertGreater(
+            appearance_similarity((0.9, 0.2, 0.1), (0.88, 0.22, 0.12)),
+            appearance_similarity((0.9, 0.2, 0.1), (0.1, 0.8, 0.7)),
+        )
+
+    def test_control_sim_redetection_scores_motion_and_appearance(self) -> None:
+        config = SimConfig()
+        matching = CandidateObservation(
+            object_id="target",
+            observation=type(
+                "Observation",
+                (),
+                {"visible": True, "confidence": 0.8, "norm_x": 0.2, "norm_y": 0.1, "box_size": 0.1, "distance_m": 40},
+            )(),
+            ground_position=Vec3(10, 0, 0),
+            appearance=(0.9, 0.2, 0.1),
+            is_target=True,
+        )
+        distractor = CandidateObservation(
+            object_id="distractor",
+            observation=type(
+                "Observation",
+                (),
+                {"visible": True, "confidence": 0.95, "norm_x": 0.1, "norm_y": 0.1, "box_size": 0.1, "distance_m": 40},
+            )(),
+            ground_position=Vec3(9, 0, 0),
+            appearance=(0.1, 0.8, 0.7),
+            is_target=False,
+        )
+
+        match_score = redetection_score(
+            matching,
+            predicted_position=Vec3(10, 0, 0),
+            search_radius_m=20,
+            target_appearance=(0.9, 0.2, 0.1),
+            config=config,
+        )
+        distractor_score = redetection_score(
+            distractor,
+            predicted_position=Vec3(10, 0, 0),
+            search_radius_m=20,
+            target_appearance=(0.9, 0.2, 0.1),
+            config=config,
+        )
+
+        self.assertGreater(match_score, distractor_score)
+
+    def test_control_sim_selects_redetection_candidate_above_threshold(self) -> None:
+        config = SimConfig(redetect_min_score=0.5)
+        candidate = CandidateObservation(
+            object_id="target",
+            observation=type(
+                "Observation",
+                (),
+                {"visible": True, "confidence": 0.8, "norm_x": 0.2, "norm_y": 0.1, "box_size": 0.1, "distance_m": 40},
+            )(),
+            ground_position=Vec3(10, 0, 0),
+            appearance=(0.9, 0.2, 0.1),
+            is_target=True,
+        )
+
+        selected, score = select_redetection_candidate(
+            [candidate],
+            estimated_target_position=Vec3(9, 0, 0),
+            estimated_target_velocity=Vec3(1, 0, 0),
+            estimated_target_speed_mps=1,
+            target_appearance=(0.9, 0.2, 0.1),
+            lost_time_sec=0.2,
+            config=config,
+        )
+
+        self.assertEqual(selected, candidate)
+        self.assertGreaterEqual(score, config.redetect_min_score)
+
+    def test_control_sim_command_turns_toward_offset(self) -> None:
+        observation = type(
+            "Observation",
+            (),
+            {
+                "visible": True,
+                "confidence": 0.9,
+                "norm_x": 0.5,
+                "norm_y": 0.25,
+                "box_size": 0.1,
+            },
+        )()
+
+        command = command_from_observation(observation, SimConfig())
+
+        self.assertGreater(command.yaw_rate_rad_s, 0)
+        self.assertLess(command.camera_pitch_rate_rad_s, 0)
+        self.assertGreater(command.forward_mps, 0)
+
+    def test_control_sim_step_drone_applies_command_limits(self) -> None:
+        config = SimConfig(dt_sec=1.0, drone_altitude_m=35)
+        drone = DroneState(position=Vec3(0, 0, 35), yaw_rad=0.0, camera_pitch_rad=np.deg2rad(-55))
+        command = ControlCommand(
+            yaw_rate_rad_s=np.deg2rad(10),
+            camera_pitch_rate_rad_s=np.deg2rad(-5),
+            forward_mps=5.0,
+            lateral_mps=0.0,
+            reason="test",
+        )
+
+        updated = step_drone(drone, command, config)
+
+        self.assertAlmostEqual(np.rad2deg(updated.yaw_rad), 10.0)
+        self.assertAlmostEqual(np.rad2deg(updated.camera_pitch_rad), -60.0)
+        self.assertGreater(updated.position.x, 0)
+        self.assertEqual(updated.position.z, 35)
+
+    def test_control_sim_runs_expected_number_of_steps(self) -> None:
+        report = run_simulation(SimConfig(duration_sec=1.0, dt_sec=0.1, seed=1))
+
+        self.assertEqual(report["summary"]["steps"], 10)
+        self.assertEqual(len(report["trajectory"]), 10)
+        self.assertIn("visible_ratio", report["summary"])
+        self.assertIn("lost_events", report["summary"])
+        self.assertIn(report["summary"]["grade"], {"stable", "marginal", "failed"})
+
+    def test_control_sim_scenarios_are_available(self) -> None:
+        self.assertIn("swerve", SCENARIOS)
+        self.assertIn("sharp_turns", SCENARIOS)
+        self.assertIn("fast_break", SCENARIOS)
+
+    def test_control_sim_swerve_scenario_changes_turn_direction(self) -> None:
+        config = SimConfig(scenario="swerve", dt_sec=0.1)
+        target = TargetState(position=Vec3(0, 0, 0), heading_rad=0.0, speed_mps=2.0)
+        rng = __import__("random").Random(1)
+
+        first = scenario_turn_rate_deg_s(0, target, config, rng)
+        later = scenario_turn_rate_deg_s(25, target, config, rng)
+
+        self.assertGreater(first, 0)
+        self.assertLess(later, 0)
+
+    def test_control_sim_fast_break_increases_target_speed(self) -> None:
+        config = SimConfig(scenario="fast_break", target_speed_mps=4.0)
+
+        self.assertGreaterEqual(scenario_speed_mps(10, config), 4.0)
+
+    def test_control_sim_rejects_unknown_scenario(self) -> None:
+        with self.assertRaises(ValueError):
+            run_simulation(SimConfig(scenario="moonwalk"))
+
+    def test_control_sim_scenario_grade_thresholds(self) -> None:
+        self.assertEqual(
+            scenario_grade(
+                {
+                    "visible_ratio": 1.0,
+                    "average_screen_error": 0.1,
+                    "longest_lost_streak_sec": 0.0,
+                    "failed_reacquisition_count": 0,
+                }
+            ),
+            "stable",
+        )
+        self.assertEqual(
+            scenario_grade(
+                {
+                    "visible_ratio": 0.85,
+                    "average_screen_error": 0.3,
+                    "longest_lost_streak_sec": 2.0,
+                    "failed_reacquisition_count": 0,
+                }
+            ),
+            "marginal",
+        )
+        self.assertEqual(
+            scenario_grade(
+                {
+                    "visible_ratio": 0.5,
+                    "average_screen_error": 0.1,
+                    "longest_lost_streak_sec": 0.0,
+                    "failed_reacquisition_count": 0,
+                }
+            ),
+            "failed",
+        )
+
+    def test_control_sim_step_target_respects_scenario_speed(self) -> None:
+        config = SimConfig(scenario="fast_break", target_speed_mps=4.0)
+        target = TargetState(position=Vec3(0, 0, 0), heading_rad=0.0, speed_mps=4.0)
+
+        updated = step_target(target, config, __import__("random").Random(1), step=10)
+
+        self.assertGreaterEqual(updated.speed_mps, 4.0)
+
+    def test_control_sim_reacquisition_metrics_count_lost_streaks(self) -> None:
+        rows = [
+            {"visible": True},
+            {"visible": False},
+            {"visible": False},
+            {"visible": True},
+            {"visible": False},
+        ]
+
+        metrics = reacquisition_metrics(rows, dt_sec=0.1)
+
+        self.assertEqual(metrics["lost_events"], 2)
+        self.assertEqual(metrics["reacquired_count"], 1)
+        self.assertEqual(metrics["failed_reacquisition_count"], 1)
+        self.assertEqual(metrics["longest_lost_streak_frames"], 2)
+        self.assertAlmostEqual(metrics["average_reacquisition_time_sec"], 0.2)
 
 
 if __name__ == "__main__":
