@@ -91,17 +91,17 @@ class SimConfig:
     horizontal_fov_deg: float = 70.0
     vertical_fov_deg: float = 45.0
     desired_box_size: float = 0.16
-    yaw_gain: float = 1.0
-    pitch_gain: float = 0.9
+    yaw_gain: float = 2.2
+    pitch_gain: float = 1.5
     forward_gain: float = 35.0
-    lateral_gain: float = 3.0
-    max_yaw_rate_deg_s: float = 35.0
-    max_pitch_rate_deg_s: float = 25.0
+    lateral_gain: float = 5.0
+    max_yaw_rate_deg_s: float = 50.0
+    max_pitch_rate_deg_s: float = 35.0
     max_forward_mps: float = 10.0
-    max_lateral_mps: float = 4.0
+    max_lateral_mps: float = 5.0
     min_camera_pitch_deg: float = -85.0
     max_camera_pitch_deg: float = -20.0
-    prediction_gain: float = 1.0
+    prediction_gain: float = 1.2
     max_prediction_sec: float = 0.6
     reacquire_timeout_sec: float = 2.0
     intercept_enabled: bool = True
@@ -1088,15 +1088,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-pitch-deg", type=float, default=-45.0, help="Camera pitch angle; negative points downward.")
     parser.add_argument("--horizontal-fov-deg", type=float, default=70.0, help="Simulated camera horizontal field of view.")
     parser.add_argument("--vertical-fov-deg", type=float, default=45.0, help="Simulated camera vertical field of view.")
-    parser.add_argument("--yaw-gain", type=float, default=1.0, help="Controller yaw gain.")
-    parser.add_argument("--pitch-gain", type=float, default=0.9, help="Controller camera pitch gain.")
+    parser.add_argument("--yaw-gain", type=float, default=2.2, help="Controller yaw gain.")
+    parser.add_argument("--pitch-gain", type=float, default=1.5, help="Controller camera pitch gain.")
     parser.add_argument("--forward-gain", type=float, default=35.0, help="Controller forward gain.")
-    parser.add_argument("--lateral-gain", type=float, default=3.0, help="Controller lateral gain.")
-    parser.add_argument("--max-yaw-rate-deg-s", type=float, default=35.0, help="Maximum simulated drone yaw command.")
-    parser.add_argument("--max-pitch-rate-deg-s", type=float, default=25.0, help="Maximum simulated gimbal pitch command.")
+    parser.add_argument("--lateral-gain", type=float, default=5.0, help="Controller lateral gain.")
+    parser.add_argument("--max-yaw-rate-deg-s", type=float, default=50.0, help="Maximum simulated drone yaw command.")
+    parser.add_argument("--max-pitch-rate-deg-s", type=float, default=35.0, help="Maximum simulated gimbal pitch command.")
     parser.add_argument("--max-forward-mps", type=float, default=10.0, help="Maximum simulated drone forward speed.")
-    parser.add_argument("--max-lateral-mps", type=float, default=4.0, help="Maximum simulated drone lateral speed.")
-    parser.add_argument("--prediction-gain", type=float, default=1.0, help="Lead target screen position by this fraction of the latency.")
+    parser.add_argument("--max-lateral-mps", type=float, default=5.0, help="Maximum simulated drone lateral speed.")
+    parser.add_argument("--prediction-gain", type=float, default=1.2, help="Lead target screen position by this fraction of the latency.")
     parser.add_argument("--reacquire-timeout-sec", type=float, default=2.0, help="How long to steer using predicted target position after losing sight.")
     parser.add_argument("--no-intercept", action="store_true", help="Disable world-position lost-target intercept fallback.")
     parser.add_argument("--intercept-base-distance-m", type=float, default=25.0, help="Base distance for allowing lost-target intercept.")

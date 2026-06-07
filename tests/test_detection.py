@@ -11,6 +11,14 @@ from PIL import Image
 import aerial_vision.classify as classify_module
 from aerial_vision.analysis import ImageAnalysis
 from aerial_vision.annotate import draw_detections
+from aerial_vision.benchmark_control_sim import (
+    aggregate_runs,
+    benchmark_control_sim,
+    control_sim_run_passed,
+    control_sim_score,
+    render_control_benchmark_html,
+)
+from aerial_vision.benchmark_race import parse_bool_modes, race_score, summarize_run
 from aerial_vision.classify import apply_profile_defaults, clean_previous_outputs
 from aerial_vision.control_sim import (
     ControlCommand,
@@ -43,12 +51,29 @@ from aerial_vision.detection import (
     filter_by_geometry,
     filter_detections,
 )
+from aerial_vision.drone_bridge import (
+    BridgeConfig,
+    MockPX4Bridge,
+    control_intent_from_dict,
+    load_control_intents,
+    run_bridge_session,
+    setpoint_from_intent,
+    timing_gaps,
+)
 from aerial_vision.export_review import export_confirmed, safe_run_path
 from aerial_vision.benchmark_live import live_score, parse_int_list, parse_optional_int_list, summarize_result
 from aerial_vision.live_track import observation_contains_point, parse_source, resolve_label_filter, select_observation_at_point
 from aerial_vision.live_source import frame_time_sec, playback_status, realtime_delay_sec, should_drop_frame
+from aerial_vision.intent_sim import (
+    IntentFrame,
+    MockBridgeConfig,
+    bridge_command,
+    run_intent_simulation,
+)
 from aerial_vision.pick_target import selected_track_id
 from aerial_vision.pipeline import DetectionSettings, DetectorBundle, analyze_image_with_detectors
+from aerial_vision.race_sim import RaceConfig, intent_from_observation, run_race_simulation
+from aerial_vision.safety import SafetyLimits, evaluate_race_benchmark, evaluate_race_summary, safety_filter_intent
 from aerial_vision.scan_video import (
     detection_difference,
     format_timestamp,
@@ -58,6 +83,7 @@ from aerial_vision.scan_video import (
     timestamp_display,
 )
 from aerial_vision.track_video import (
+    ControlIntent,
     class_ids_for_model,
     control_intent_from_lock,
     color_histogram,
@@ -898,6 +924,399 @@ class DetectionTest(unittest.TestCase):
         self.assertEqual(intent.mode, "hold")
         self.assertEqual(intent.forward_mps, 0.0)
 
+    def test_intent_sim_parses_intent_frame(self) -> None:
+        frame = IntentFrame.from_dict(
+            {
+                "frame_index": 3,
+                "timestamp_sec": 1.5,
+                "mode": "tag",
+                "yaw_rate_deg_s": 12,
+                "camera_pitch_rate_deg_s": -4,
+                "forward_mps": 2,
+                "normalized_offset": [0.2, -0.1],
+                "center_error": 0.22,
+                "tag_enabled": True,
+            }
+        )
+
+        self.assertEqual(frame.mode, "tag")
+        self.assertEqual(frame.normalized_offset, (0.2, -0.1))
+        self.assertTrue(frame.tag_enabled)
+
+    def test_intent_sim_center_command_blocks_forward_motion(self) -> None:
+        frame = IntentFrame.from_dict(
+            {
+                "frame_index": 1,
+                "timestamp_sec": 0.1,
+                "mode": "center",
+                "yaw_rate_deg_s": 90,
+                "camera_pitch_rate_deg_s": 0,
+                "forward_mps": 5,
+                "normalized_offset": [0.5, 0],
+                "center_error": 0.5,
+            }
+        )
+
+        command = bridge_command(frame, MockBridgeConfig(max_yaw_rate_deg_s=30))
+
+        self.assertEqual(command.yaw_rate_deg_s, 30)
+        self.assertEqual(command.forward_mps, 0.0)
+
+    def test_intent_sim_tag_intent_moves_mock_drone(self) -> None:
+        intents = [
+            IntentFrame.from_dict(
+                {
+                    "frame_index": index,
+                    "timestamp_sec": index * 0.1,
+                    "mode": "tag",
+                    "yaw_rate_deg_s": 0,
+                    "camera_pitch_rate_deg_s": 0,
+                    "forward_mps": 2,
+                    "normalized_offset": [0.0, 0.0],
+                    "center_error": 0.0,
+                    "tag_enabled": True,
+                }
+            )
+            for index in range(5)
+        ]
+
+        report = run_intent_simulation(intents, MockBridgeConfig())
+
+        self.assertEqual(report["summary"]["tag_frames"], 5)
+        self.assertGreater(report["summary"]["final_distance_m"], 0)
+
+    def test_drone_bridge_parses_control_intent(self) -> None:
+        intent = control_intent_from_dict(
+            {
+                "frame_index": 4,
+                "timestamp_sec": 0.4,
+                "mode": "tag",
+                "reason": "target visible",
+                "yaw_rate_deg_s": 12,
+                "camera_pitch_rate_deg_s": -3,
+                "forward_mps": 2,
+                "normalized_offset": [0.1, -0.2],
+                "center_error": 0.22,
+                "tag_enabled": True,
+                "box_area_ratio": 0.02,
+            }
+        )
+
+        self.assertEqual(intent.mode, "tag")
+        self.assertEqual(intent.normalized_offset, (0.1, -0.2))
+        self.assertEqual(intent.box_area_ratio, 0.02)
+
+    def test_drone_bridge_loads_intents_from_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "control_intent.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "intents": [
+                            {
+                                "frame_index": 1,
+                                "timestamp_sec": 0.1,
+                                "mode": "center",
+                                "reason": "target visible",
+                                "yaw_rate_deg_s": 1,
+                                "camera_pitch_rate_deg_s": 2,
+                                "forward_mps": 0,
+                                "normalized_offset": [0, 0],
+                                "center_error": 0,
+                                "tag_enabled": False,
+                                "box_area_ratio": None,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            intents = load_control_intents(path)
+
+        self.assertEqual(len(intents), 1)
+        self.assertEqual(intents[0].frame_index, 1)
+
+    def test_drone_bridge_requires_arm_before_offboard(self) -> None:
+        bridge = MockPX4Bridge()
+
+        with self.assertRaises(RuntimeError):
+            bridge.set_mode_offboard()
+
+    def test_drone_bridge_session_safety_filters_forward_motion(self) -> None:
+        intents = [
+            ControlIntent(
+                frame_index=index,
+                timestamp_sec=index * 0.1,
+                mode="center",
+                reason="target visible",
+                yaw_rate_deg_s=90,
+                camera_pitch_rate_deg_s=0,
+                forward_mps=5,
+                normalized_offset=(0.2, 0.0),
+                center_error=0.2,
+                tag_enabled=False,
+                box_area_ratio=0.01,
+            )
+            for index in range(12)
+        ]
+
+        report = run_bridge_session(intents, MockPX4Bridge(), bridge_config=BridgeConfig())
+
+        self.assertTrue(report["summary"]["ready_for_sitl"])
+        self.assertEqual(report["summary"]["forward_setpoints"], 0)
+        self.assertEqual(report["setpoints"][0]["yaw_rate_deg_s"], 45.0)
+
+    def test_drone_bridge_session_detects_timing_gaps(self) -> None:
+        intents = [
+            ControlIntent(
+                frame_index=0,
+                timestamp_sec=0.0,
+                mode="tag",
+                reason="target visible",
+                yaw_rate_deg_s=0,
+                camera_pitch_rate_deg_s=0,
+                forward_mps=1,
+                normalized_offset=(0.0, 0.0),
+                center_error=0.0,
+                tag_enabled=True,
+                box_area_ratio=0.01,
+            ),
+            ControlIntent(
+                frame_index=1,
+                timestamp_sec=1.0,
+                mode="tag",
+                reason="target visible",
+                yaw_rate_deg_s=0,
+                camera_pitch_rate_deg_s=0,
+                forward_mps=1,
+                normalized_offset=(0.0, 0.0),
+                center_error=0.0,
+                tag_enabled=True,
+                box_area_ratio=0.01,
+            ),
+        ]
+
+        gaps = timing_gaps(intents, BridgeConfig(max_setpoint_gap_sec=0.5))
+        report = run_bridge_session(intents, MockPX4Bridge(), bridge_config=BridgeConfig(max_setpoint_gap_sec=0.5))
+
+        self.assertEqual(len(gaps), 1)
+        self.assertFalse(report["summary"]["ready_for_sitl"])
+        self.assertEqual(report["summary"]["timing_gap_count"], 1)
+
+    def test_drone_bridge_setpoint_from_intent(self) -> None:
+        intent = ControlIntent(
+            frame_index=2,
+            timestamp_sec=0.2,
+            mode="tag",
+            reason="target centered",
+            yaw_rate_deg_s=3,
+            camera_pitch_rate_deg_s=-2,
+            forward_mps=1.5,
+            normalized_offset=(0.0, 0.0),
+            center_error=0.0,
+            tag_enabled=True,
+            box_area_ratio=0.02,
+        )
+
+        setpoint = setpoint_from_intent(intent)
+
+        self.assertEqual(setpoint.frame_index, 2)
+        self.assertEqual(setpoint.forward_mps, 1.5)
+        self.assertTrue(setpoint.tag_enabled)
+
+    def test_race_sim_center_intent_does_not_move_forward(self) -> None:
+        observation = type(
+            "Observation",
+            (),
+            {
+                "visible": True,
+                "confidence": 0.9,
+                "norm_x": 0.5,
+                "norm_y": 0.2,
+                "box_size": 0.1,
+            },
+        )()
+
+        intent = intent_from_observation(
+            observation,
+            previous_box_size=0.1,
+            previous_offset=None,
+            tag_mode=False,
+            config=RaceConfig(),
+        )
+
+        self.assertEqual(intent.mode, "center")
+        self.assertEqual(intent.forward_mps, 0.0)
+        self.assertLess(intent.camera_pitch_rate_deg_s, 0.0)
+
+    def test_race_sim_tag_intent_moves_when_centered(self) -> None:
+        observation = type(
+            "Observation",
+            (),
+            {
+                "visible": True,
+                "confidence": 0.9,
+                "norm_x": 0.02,
+                "norm_y": 0.01,
+                "box_size": 0.1,
+            },
+        )()
+
+        intent = intent_from_observation(
+            observation,
+            previous_box_size=0.1,
+            previous_offset=None,
+            tag_mode=True,
+            config=RaceConfig(),
+        )
+
+        self.assertEqual(intent.mode, "tag")
+        self.assertGreater(intent.forward_mps, 0.0)
+
+    def test_race_sim_runs_closed_loop(self) -> None:
+        report = run_race_simulation(RaceConfig(duration_sec=1.0, dt_sec=0.1, seed=2))
+
+        self.assertEqual(report["summary"]["frames"], 10)
+        self.assertIn("mode_counts", report["summary"])
+        self.assertEqual(len(report["trajectory"]), 10)
+
+    def test_race_benchmark_parses_modes(self) -> None:
+        self.assertEqual(parse_bool_modes("center,tag,false,true"), [False, True, False, True])
+        with self.assertRaises(Exception):
+            parse_bool_modes("moon")
+
+    def test_race_benchmark_scores_stable_runs_higher(self) -> None:
+        stable = {
+            "visible_ratio": 1.0,
+            "average_center_error": 0.2,
+            "lost_frames": 0,
+            "frames": 100,
+            "final_distance_m": 10,
+        }
+        unstable = {
+            "visible_ratio": 0.5,
+            "average_center_error": 0.8,
+            "lost_frames": 50,
+            "frames": 100,
+            "final_distance_m": 10,
+        }
+
+        self.assertGreater(race_score(stable, tag_mode=False), race_score(unstable, tag_mode=False))
+
+    def test_race_benchmark_summarizes_run(self) -> None:
+        report = {
+            "summary": {
+                "frames": 10,
+                "visible_ratio": 1.0,
+                "lost_frames": 0,
+                "average_center_error": 0.1,
+                "final_distance_m": 5.0,
+                "mode_counts": {"center": 10},
+            }
+        }
+
+        summary = summarize_run(report, tag_mode=False)
+
+        self.assertEqual(summary["frames"], 10)
+        self.assertGreater(summary["score"], 0)
+
+    def test_safety_filter_blocks_center_forward_and_clamps_rates(self) -> None:
+        intent = control_intent_from_lock(
+            type(
+                "Lock",
+                (),
+                {
+                    "frame_index": 1,
+                    "timestamp_sec": 0.1,
+                    "state": "locked",
+                    "reason": "target visible",
+                    "normalized_offset": (2.0, 0.0),
+                    "box": BoundingBox(0, 0, 100, 100),
+                },
+            )(),
+            max_yaw_rate_deg_s=90,
+            max_forward_mps=5,
+        )
+
+        filtered = safety_filter_intent(intent, SafetyLimits(max_yaw_rate_deg_s=30))
+
+        self.assertEqual(filtered.forward_mps, 0.0)
+        self.assertEqual(filtered.yaw_rate_deg_s, 30)
+
+    def test_safety_filter_blocks_off_center_tag_forward(self) -> None:
+        intent = control_intent_from_lock(
+            type(
+                "Lock",
+                (),
+                {
+                    "frame_index": 1,
+                    "timestamp_sec": 0.1,
+                    "state": "locked",
+                    "reason": "target visible",
+                    "normalized_offset": (0.6, 0.0),
+                    "box": BoundingBox(0, 0, 100, 100),
+                },
+            )(),
+            tag_enabled=True,
+            max_forward_mps=5,
+            tag_center_gate=1.0,
+        )
+
+        filtered = safety_filter_intent(intent, SafetyLimits(max_tag_center_error=0.45))
+
+        self.assertEqual(filtered.mode, "tag")
+        self.assertEqual(filtered.forward_mps, 0.0)
+        self.assertIn("safety gate", filtered.reason)
+
+    def test_safety_evaluates_race_summary(self) -> None:
+        result = evaluate_race_summary(
+            {
+                "frames": 100,
+                "visible_ratio": 0.98,
+                "lost_frames": 1,
+                "average_center_error": 0.2,
+            },
+            SafetyLimits(),
+        )
+
+        self.assertTrue(result["passed"])
+
+    def test_safety_evaluates_race_benchmark_pass_ratio(self) -> None:
+        report = {
+            "runs": [
+                {
+                    "scenario": "swerve",
+                    "tag_mode": False,
+                    "target_speed_mps": 3,
+                    "horizontal_fov_deg": 70,
+                    "summary": {
+                        "frames": 100,
+                        "visible_ratio": 0.98,
+                        "lost_frames": 1,
+                        "average_center_error": 0.2,
+                    },
+                },
+                {
+                    "scenario": "sharp_turns",
+                    "tag_mode": True,
+                    "target_speed_mps": 10,
+                    "horizontal_fov_deg": 45,
+                    "summary": {
+                        "frames": 100,
+                        "visible_ratio": 0.5,
+                        "lost_frames": 50,
+                        "average_center_error": 0.8,
+                    },
+                },
+            ]
+        }
+
+        result = evaluate_race_benchmark(report, SafetyLimits(min_required_pass_ratio=0.5))
+
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["passed_runs"], 1)
+
     def test_control_sim_observes_target_in_camera_view(self) -> None:
         config = SimConfig(tracking_noise=0.0, confidence_noise=0.0)
         drone = DroneState(
@@ -1179,6 +1598,113 @@ class DetectionTest(unittest.TestCase):
         self.assertEqual(metrics["failed_reacquisition_count"], 1)
         self.assertEqual(metrics["longest_lost_streak_frames"], 2)
         self.assertAlmostEqual(metrics["average_reacquisition_time_sec"], 0.2)
+
+    def test_control_sim_benchmark_scores_stable_runs_higher(self) -> None:
+        stable = {
+            "steps": 100,
+            "visible_ratio": 1.0,
+            "lost_frames": 0,
+            "average_screen_error": 0.12,
+            "longest_lost_streak_sec": 0.0,
+            "false_redetect_frames": 0,
+            "average_yaw_rate_change_deg_s": 5.0,
+        }
+        unstable = {
+            "steps": 100,
+            "visible_ratio": 0.70,
+            "lost_frames": 30,
+            "average_screen_error": 0.8,
+            "longest_lost_streak_sec": 3.0,
+            "false_redetect_frames": 4,
+            "average_yaw_rate_change_deg_s": 50.0,
+        }
+
+        self.assertGreater(control_sim_score(stable), control_sim_score(unstable))
+
+    def test_control_sim_benchmark_pass_checks(self) -> None:
+        summary = {
+            "steps": 100,
+            "visible_ratio": 0.98,
+            "lost_frames": 1,
+            "average_screen_error": 0.2,
+            "longest_lost_streak_sec": 0.4,
+            "false_redetect_frames": 0,
+        }
+
+        passed, checks = control_sim_run_passed(summary)
+
+        self.assertTrue(passed)
+        self.assertTrue(all(checks.values()))
+
+    def test_control_sim_benchmark_aggregate_requires_80_percent(self) -> None:
+        runs = [{"passed": True, "score": 90.0, "summary": {
+            "visible_ratio": 1.0,
+            "average_screen_error": 0.1,
+            "lost_ratio": 0.0,
+            "longest_lost_streak_sec": 0.0,
+        }} for _ in range(4)]
+        runs.append({"passed": False, "score": 10.0, "summary": {
+            "visible_ratio": 0.5,
+            "average_screen_error": 0.9,
+            "lost_ratio": 0.5,
+            "longest_lost_streak_sec": 5.0,
+        }})
+
+        aggregate = aggregate_runs(runs)
+
+        self.assertTrue(aggregate["passed"])
+        self.assertEqual(aggregate["passed_runs"], 4)
+        self.assertAlmostEqual(aggregate["pass_ratio"], 0.8)
+
+    def test_control_sim_benchmark_writes_json_and_html(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = benchmark_control_sim(
+                out_dir=Path(temp_dir),
+                scenarios=["wander"],
+                durations=[0.5],
+                target_speeds=[3.0],
+                horizontal_fovs=[110.0],
+                latencies_ms=[100.0],
+                trials=1,
+                dt_sec=0.1,
+                seed=1,
+            )
+
+            self.assertTrue((Path(temp_dir) / "control_benchmark.json").exists())
+            self.assertTrue((Path(temp_dir) / "control_benchmark.html").exists())
+            self.assertEqual(report["aggregate"]["total_runs"], 1)
+
+    def test_control_sim_benchmark_html_contains_status(self) -> None:
+        html_text = render_control_benchmark_html({
+            "aggregate": {
+                "passed": True,
+                "pass_ratio": 1.0,
+                "passed_runs": 1,
+                "total_runs": 1,
+                "mean_score": 90.0,
+                "mean_average_screen_error": 0.1,
+                "max_longest_lost_streak_sec": 0.0,
+            },
+            "runs": [{
+                "passed": True,
+                "scenario": "wander",
+                "target_speed_mps": 3.0,
+                "horizontal_fov_deg": 110.0,
+                "latency_ms": 100.0,
+                "score": 90.0,
+                "checks": {"visible_ratio": True},
+                "summary": {
+                    "visible_ratio": 1.0,
+                    "average_screen_error": 0.1,
+                    "lost_ratio": 0.0,
+                    "longest_lost_streak_sec": 0.0,
+                    "false_redetect_ratio": 0.0,
+                },
+            }],
+        })
+
+        self.assertIn("Control Simulation Benchmark", html_text)
+        self.assertIn("PASSED", html_text)
 
 
 if __name__ == "__main__":
